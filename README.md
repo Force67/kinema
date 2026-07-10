@@ -62,6 +62,46 @@ kinds and precomputed structures, never node-object trees walked at runtime:
   leaving state's still-open ranges on a transition. Ranged events promote a
   clip to a v2 blob; a clip with none is byte-identical to a v1 build and the
   loader accepts both.
+- **Float curve tracks**: named scalar channels (facial weights, material
+  params, authored IK weights) baked alongside the bone tracks - uniformly
+  sampled, 16-bit range-quantized. `ClipBuilder::AddCurve(name)` +
+  `SetCurveSample(frame, curve, value)`; `Clip::SampleCurve(hash, t)` at
+  runtime. Authoring a curve promotes the blob to v3; a curve-free clip stays
+  byte-identical to a v1/v2 build (guarded by `tools/golden.cc`'s baked hashes)
+  and the loader reads v1/v2/v3.
+
+## Pose tooling
+
+Constraints that run over a **model-space** pose and write the result back to
+local. `LocalToModel` / `ModelToLocal` are the public conversion kernels (one
+forward sweep, parents precede children); every solver below takes the
+caller-produced model pose so a chain of solves shares one buffer. All are flat,
+allocation-free kernels.
+
+- **Two-bone IK** (`SolveTwoBoneIK`): arm/leg solve over a root->mid->end chain.
+  Analytic triangle construction (law of cosines) drives the end joint onto a
+  target with a pole/hint for the bend plane, a softness slack at full
+  extension, and a weight that blends the solve over the FK pose.
+- **Look-at / aim** (`SolveLookAt`, `SolveLookAtChain`): single-joint aim of a
+  configurable forward axis with a cone clamp and weight, plus an N-joint
+  distributed variant that spreads the aim across a chain by per-joint fractions
+  (serial chains land the tip exactly when the fractions sum to one).
+- **Foot placement** (`SolveFootPlacement`): the pure-math half of foot IK -
+  kinema does no raycasts. The caller feeds per-foot hit points/normals; the
+  helper computes each foot's IK target, drops the pelvis by the lowest-foot
+  rule so no leg overextends, then runs the two-bone solves and returns the
+  pelvis offset.
+- **Pose mirroring** (`MirrorPose` + `MirrorTable`): reflects a local pose across
+  the sagittal (X) plane - swap paired bones, negate translation along and
+  quaternion components across the flip axis (the exact reflection of a
+  rotation, so a symmetric rig round-trips). `BuildMirrorTable` auto-pairs from a
+  caller-supplied name callback and left/right tokens, with no engine naming
+  baked in.
+- **Retargeting** (`RetargetTable` + `RetargetPose`): transfers a source local
+  pose onto a target skeleton via a bone map and both bind poses - rotations
+  carried through the bind-orientation difference, translations scaled by the
+  per-bone reference-length ratio (proportion-aware). Basic by design: rotation
+  copy + proportion scaling, not full IK retargeting.
 
 ## Use
 
@@ -80,23 +120,27 @@ builder.AddEvent("FootLeft", 0.43f);
 builder.AddRootKey(duration, total_displacement);
 kinema::OwnedClip clip(builder.Build());   // blob is disk-cacheable as-is
 
-// Runtime: registers + a compiled program per actor archetype.
+// Runtime: registers + a compiled program per actor archetype. (Fields are set
+// individually rather than with C++20 designated initializers so the code stays
+// C++17 / MSVC-clean.)
 kinema::PoseArena arena(num_bones, 4);
-kinema::PoseOp program[] = {
-    {.kind = kinema::PoseOp::Kind::kSample, .dst = 0, .clip = clip.get(), .time = t},
-    {.kind = kinema::PoseOp::Kind::kSample, .dst = 1, .clip = other, .time = t2},
-    {.kind = kinema::PoseOp::Kind::kBlend, .dst = 2, .a = 0, .b = 1, .alpha = 0.3f},
-};
+kinema::PoseOp program[3];
+program[0].kind = kinema::PoseOp::Kind::kSample; program[0].dst = 0;
+program[0].clip = clip.get(); program[0].time = t;
+program[1].kind = kinema::PoseOp::Kind::kSample; program[1].dst = 1;
+program[1].clip = other; program[1].time = t2;
+program[2].kind = kinema::PoseOp::Kind::kBlend; program[2].dst = 2;
+program[2].a = 0; program[2].b = 1; program[2].alpha = 0.3f;
 kinema::PoseView pose = kinema::ExecuteProgram(program, 3, arena);
 
 // Graph core: a blend space compiled into one op, driven by live params.
 kinema::BlendSpace speed(kinema::BlendSpace::Dim::k1D);
 speed.Add(walk.get(), 0.0f).Add(jog.get(), 3.0f).Add(run.get(), 6.0f);
 speed.Finalize();
-kinema::PoseOp locomotion[] = {
-    {.kind = kinema::PoseOp::Kind::kBlendSpace, .dst = 0, .a = 1,
-     .space = &speed, .time_param = 0, .coord_param = 1},  // a = scratch reg
-};
+kinema::PoseOp locomotion[1];
+locomotion[0].kind = kinema::PoseOp::Kind::kBlendSpace; locomotion[0].dst = 0;
+locomotion[0].a = 1;  // scratch register
+locomotion[0].space = &speed; locomotion[0].time_param = 0; locomotion[0].coord_param = 1;
 float params[2] = {phase01, speed_mps};       // written per frame, no realloc
 kinema::PoseParams pp{params, 2};
 pose = kinema::ExecuteProgram(locomotion, 1, arena, &pp);
@@ -113,7 +157,9 @@ kinema::StateMachineBuilder smb(num_bones);
 kinema::u16 idle = smb.AddClipState(idle_clip.get());
 kinema::u16 run = smb.AddClipState(run_clip.get());
 kinema::ConditionAtom go = kinema::ConditionAtom::Greater(/*param=*/0, 3.0f);
-smb.AddTransition(idle, run, {.duration = 0.2f}, &go, 1);   // speed>3 -> run
+kinema::TransitionDesc to_run;
+to_run.duration = 0.2f;
+smb.AddTransition(idle, run, to_run, &go, 1);   // speed>3 -> run
 kinema::StateMachine machine = smb.Build();
 
 kinema::StateMachineInstance actor;
