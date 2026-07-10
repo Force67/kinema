@@ -189,6 +189,20 @@ class Clip {
     }
   }
 
+  // Float curve tracks (facial weights, material params, authored IK weights):
+  // named scalar channels sampled uniformly like bone tracks, 16-bit quantized
+  // with a per-curve range. v1/v2 clips carry none (num_curves()==0). Authoring
+  // any curve promotes the blob to v3; a clip with none stays byte-identical to
+  // a v1/v2 build (see Build) and v1/v2/v3 all load.
+  u32 num_curves() const;
+  u64 CurveHash(u32 index) const;
+  int FindCurve(u64 name_hash) const;  // curve index or -1
+  // Value of curve `index` at `time` (clamped, linearly interpolated).
+  f32 SampleCurveIndex(u32 index, f32 time) const;
+  // Value of the named curve at `time`, or `fallback` if the clip has no such
+  // curve. Lookup is a small linear scan (curves are few).
+  f32 SampleCurve(u64 name_hash, f32 time, f32 fallback = 0.0f) const;
+
   // Ranged (notify-state) events. v1 clips have none (num_ranged_events()==0).
   u32 num_ranged_events() const;
   ClipRangedEvent RangedEvent(u32 index) const;
@@ -246,12 +260,21 @@ class ClipBuilder {
   void AddRangedEvent(std::string_view name, f32 begin, f32 end);
   // Sparse cumulative root-motion keys (time, displacement-from-start).
   void AddRootKey(f32 time, const Vec3& translation);
+  // Declare a named scalar curve; returns its index. Samples default to 0 until
+  // set with SetCurveSample. Authoring at least one curve promotes the blob to
+  // v3 (a clip with none is byte-identical to a v1/v2 build).
+  u16 AddCurve(std::string_view name);
+  void SetCurveSample(u32 frame, u32 curve, f32 value);  // uniform, like SetSample
   std::vector<u8> Build() const;
 
  private:
   struct RangedEntry {
     std::string name;
     f32 begin, end;
+  };
+  struct CurveEntry {
+    std::string name;
+    std::vector<f32> samples;  // frames_ values
   };
   u32 tracks_, frames_;
   f32 rate_;
@@ -262,6 +285,7 @@ class ClipBuilder {
   std::vector<std::pair<std::string, f32>> events_;
   std::vector<RangedEntry> ranged_;
   std::vector<std::pair<f32, Vec3>> root_keys_;
+  std::vector<CurveEntry> curves_;
 };
 
 // ---------------------------------------------------------------------------

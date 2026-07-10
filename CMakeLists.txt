@@ -25,4 +25,10 @@ if(KINEMA_BUILD_TESTS)
   add_executable(kinematest test/kinema_test.cc)
   target_link_libraries(kinematest PRIVATE kinema)
   add_test(NAME kinematest COMMAND kinematest)
+
+  # golden: regenerates the blob byte-layout hashes baked into the test. Run it
+  # by hand after a format change and diff its output against the kGolden*
+  # constants in test/kinema_test.cc.
+  add_executable(kinema_golden tools/golden.cc)
+  target_link_libraries(kinema_golden PRIVATE kinema)
 endif()

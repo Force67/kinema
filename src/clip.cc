@@ -15,9 +15,25 @@ constexpr u32 kMagic = 0x314D4E4Bu;  // 'KNM1'
 // still written as version 1 and is byte-identical to a v1 build; the loader
 // accepts both. The ranged block needs no new header offset: it is derived as
 // the 8-aligned position right after the point-event block.
+// Version 3 ("KNM3") adds float curve tracks. To keep a curve-free clip
+// byte-identical to a v1/v2 build, no field is added to Header. Instead, when
+// (and only when) curves are present, a fixed CurveHeader is written as the very
+// first block right after Header - at a derivable offset, align8(sizeof(Header))
+// - and the loader reads it there for v3 blobs. v1/v2 blobs never carry it, so
+// their byte layout is unchanged.
 constexpr u32 kVersion1 = 1;
 constexpr u32 kVersion2 = 2;
+constexpr u32 kVersion3 = 3;
 constexpr u32 kFlagAdditive = 1u << 0;
+
+// Located at align8(sizeof(Header)) in v3 blobs only.
+struct CurveHeader {
+  u32 num_curves;
+  u32 pad;
+  u64 off_hashes;  // u64[num_curves]
+  u64 off_range;   // f32[num_curves * 2]: (min, step) per curve
+  u64 off_keys;    // u16[num_frames * num_curves], frame-major
+};
 
 // All offsets are from the blob start; every block is 8-aligned so the blob
 // can be mapped and used in place on any platform we care about.
@@ -59,6 +75,9 @@ struct RootKey {
   f32 time, x, y, z;
 };
 
+// In a v3 blob the CurveHeader is the first block after Header, 8-aligned.
+inline u64 CurveHeaderOffset() { return (sizeof(Header) + 7ull) & ~7ull; }
+
 const Header& Head(const u8* blob) { return *reinterpret_cast<const Header*>(blob); }
 
 template <typename T>
@@ -82,9 +101,15 @@ std::optional<Clip> Clip::FromBlob(const u8* data, size_t size) {
   if (!data || size < sizeof(Header)) return std::nullopt;
   const Header& h = Head(data);
   if (h.magic != kMagic) return std::nullopt;
-  if (h.version != kVersion1 && h.version != kVersion2) return std::nullopt;
+  if (h.version != kVersion1 && h.version != kVersion2 && h.version != kVersion3) {
+    return std::nullopt;
+  }
   // v1 blobs never carry ranged events (the field was reserved padding).
   if (h.version == kVersion1 && h.num_ranged != 0) return std::nullopt;
+  // v3 blobs carry a CurveHeader right after Header; make sure it fits.
+  if (h.version == kVersion3 && CurveHeaderOffset() + sizeof(CurveHeader) > size) {
+    return std::nullopt;
+  }
   if (h.total_size > size) return std::nullopt;
   if (h.num_anim_rot > h.num_tracks || h.num_anim_trans > h.num_tracks ||
       h.num_anim_scale > h.num_tracks) {
@@ -102,6 +127,52 @@ f32 Clip::duration() const { return Head(blob_).duration; }
 bool Clip::additive() const { return (Head(blob_).flags & kFlagAdditive) != 0; }
 size_t Clip::blob_size() const { return Head(blob_).total_size; }
 u32 Clip::num_events() const { return Head(blob_).num_events; }
+
+// ---------------------------------------------------------------------------
+// Float curves (v3)
+
+u32 Clip::num_curves() const {
+  const Header& h = Head(blob_);
+  if (h.version != kVersion3) return 0;
+  return Block<CurveHeader>(blob_, CurveHeaderOffset())->num_curves;
+}
+
+u64 Clip::CurveHash(u32 index) const {
+  const CurveHeader* ch = Block<CurveHeader>(blob_, CurveHeaderOffset());
+  return Block<u64>(blob_, ch->off_hashes)[index];
+}
+
+int Clip::FindCurve(u64 name_hash) const {
+  const u32 n = num_curves();
+  if (!n) return -1;
+  const CurveHeader* ch = Block<CurveHeader>(blob_, CurveHeaderOffset());
+  const u64* hashes = Block<u64>(blob_, ch->off_hashes);
+  for (u32 i = 0; i < n; ++i) {
+    if (hashes[i] == name_hash) return static_cast<int>(i);
+  }
+  return -1;
+}
+
+f32 Clip::SampleCurveIndex(u32 index, f32 time) const {
+  const Header& h = Head(blob_);
+  const CurveHeader* ch = Block<CurveHeader>(blob_, CurveHeaderOffset());
+  const f32* range = Block<f32>(blob_, ch->off_range);  // [curve][2]: min, step
+  const f32 mn = range[index * 2], step = range[index * 2 + 1];
+  const u16* keys = Block<u16>(blob_, ch->off_keys);
+  if (h.num_frames < 2) return mn + static_cast<f32>(keys[index]) * step;
+  f32 x = std::clamp(time, 0.0f, h.duration) * h.frame_rate;
+  u32 k = std::min(static_cast<u32>(x), h.num_frames - 2);
+  f32 a = std::clamp(x - static_cast<f32>(k), 0.0f, 1.0f);
+  const u32 stride = ch->num_curves;
+  f32 f0 = static_cast<f32>(keys[static_cast<size_t>(k) * stride + index]);
+  f32 f1 = static_cast<f32>(keys[static_cast<size_t>(k + 1) * stride + index]);
+  return mn + (f0 + (f1 - f0) * a) * step;
+}
+
+f32 Clip::SampleCurve(u64 name_hash, f32 time, f32 fallback) const {
+  int i = FindCurve(name_hash);
+  return i < 0 ? fallback : SampleCurveIndex(static_cast<u32>(i), time);
+}
 
 void Clip::Sample(f32 time, PoseView out) const {
   const Header& h = Head(blob_);
@@ -275,6 +346,18 @@ void ClipBuilder::AddRootKey(f32 time, const Vec3& translation) {
   root_keys_.emplace_back(time, translation);
 }
 
+u16 ClipBuilder::AddCurve(std::string_view name) {
+  CurveEntry e;
+  e.name = std::string(name);
+  e.samples.assign(frames_, 0.0f);
+  curves_.push_back(std::move(e));
+  return static_cast<u16>(curves_.size() - 1);
+}
+
+void ClipBuilder::SetCurveSample(u32 frame, u32 curve, f32 value) {
+  if (curve < curves_.size() && frame < frames_) curves_[curve].samples[frame] = value;
+}
+
 std::vector<u8> ClipBuilder::Build() const {
   // Hemisphere-align rotations along each track so quantized components lerp
   // through the short arc, then classify constant vs animated tracks.
@@ -382,10 +465,32 @@ std::vector<u8> ClipBuilder::Build() const {
   std::sort(roots.begin(), roots.end(),
             [](const RootKey& a, const RootKey& b) { return a.time < b.time; });
 
+  // Float curves: per-curve (min, step) range + frame-major 16-bit keys, exactly
+  // like translations. A constant curve gets step 0 (all keys read back its min).
+  const u32 num_curves = static_cast<u32>(curves_.size());
+  std::vector<u64> curve_hashes(num_curves);
+  std::vector<f32> curve_range(static_cast<size_t>(num_curves) * 2);
+  std::vector<u16> curve_keys(static_cast<size_t>(frames_) * num_curves);
+  for (u32 c = 0; c < num_curves; ++c) {
+    const auto& samples = curves_[c].samples;
+    curve_hashes[c] = HashName(curves_[c].name);
+    f32 mn = 1e30f, mx = -1e30f;
+    for (f32 v : samples) mn = std::min(mn, v), mx = std::max(mx, v);
+    f32 step = (mx - mn) / 65535.0f;
+    curve_range[c * 2] = mn;
+    curve_range[c * 2 + 1] = step;
+    for (u32 f = 0; f < frames_; ++f) {
+      f32 q = step > 0 ? (samples[f] - mn) / step : 0.0f;
+      curve_keys[static_cast<size_t>(f) * num_curves + c] =
+          static_cast<u16>(std::clamp(q, 0.0f, 65535.0f) + 0.5f);
+    }
+  }
+  const bool has_curves = num_curves > 0;
+
   // Assemble: header, then 8-aligned blocks.
   Header h{};
   h.magic = kMagic;
-  h.version = ranged.empty() ? kVersion1 : kVersion2;
+  h.version = has_curves ? kVersion3 : (ranged.empty() ? kVersion1 : kVersion2);
   h.num_tracks = tracks_;
   h.num_frames = frames_;
   h.frame_rate = rate_;
@@ -406,6 +511,16 @@ std::vector<u8> ClipBuilder::Build() const {
     blob.insert(blob.end(), p, p + bytes);
     return at;
   };
+  // v3 only: reserve the CurveHeader as the very first block so it lands at the
+  // derivable CurveHeaderOffset(); patched with real offsets after the curve
+  // data is appended. Skipped entirely for v1/v2 (byte-identical layout).
+  u64 curve_hdr_at = 0;
+  if (has_curves) {
+    CurveHeader ch{};
+    curve_hdr_at = append(&ch, sizeof(ch));
+    assert(curve_hdr_at == CurveHeaderOffset());
+    (void)curve_hdr_at;
+  }
   // Constant pose: frame 0 of every channel (animated slots get overwritten
   // during sampling, so storing them too keeps the copy branch-free).
   std::vector<Vec3> const_t(t_.begin(), t_.begin() + tracks_);
@@ -433,6 +548,17 @@ std::vector<u8> ClipBuilder::Build() const {
     (void)at;
   }
   h.off_strings = append(strings.data(), strings.size());
+  // v3 curve data blocks, then patch the reserved CurveHeader in place. Curve-
+  // free clips skip all of this and stay byte-identical to a v1/v2 build.
+  if (has_curves) {
+    CurveHeader ch{};
+    ch.num_curves = num_curves;
+    ch.pad = 0;
+    ch.off_hashes = append(curve_hashes.data(), curve_hashes.size() * sizeof(u64));
+    ch.off_range = append(curve_range.data(), curve_range.size() * sizeof(f32));
+    ch.off_keys = append(curve_keys.data(), curve_keys.size() * sizeof(u16));
+    std::memcpy(blob.data() + curve_hdr_at, &ch, sizeof(CurveHeader));
+  }
   h.total_size = blob.size();
   std::memcpy(blob.data(), &h, sizeof(Header));
   return blob;
