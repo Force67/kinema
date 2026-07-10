@@ -9,7 +9,14 @@ namespace kinema {
 namespace {
 
 constexpr u32 kMagic = 0x314D4E4Bu;  // 'KNM1'
-constexpr u32 kVersion = 1;
+// Version 1 is the original layout. Version 2 ("KNM2") adds a ranged-events
+// block, inserted between the point-event block and the string block, and
+// carries its count in what was Header::pad0. A clip with no ranged events is
+// still written as version 1 and is byte-identical to a v1 build; the loader
+// accepts both. The ranged block needs no new header offset: it is derived as
+// the 8-aligned position right after the point-event block.
+constexpr u32 kVersion1 = 1;
+constexpr u32 kVersion2 = 2;
 constexpr u32 kFlagAdditive = 1u << 0;
 
 // All offsets are from the blob start; every block is 8-aligned so the blob
@@ -20,7 +27,7 @@ struct Header {
   f32 frame_rate, duration;
   u32 flags;
   u32 num_anim_rot, num_anim_trans, num_anim_scale;
-  u32 num_events, num_root_keys, pad0;
+  u32 num_events, num_root_keys, num_ranged;  // num_ranged was pad0 (0 in v1)
   u64 off_const_t, off_const_r, off_const_s;
   u64 off_rot_idx, off_trans_idx, off_scale_idx;
   u64 off_trans_range, off_scale_range;
@@ -34,6 +41,19 @@ struct EventRecord {
   f32 time;
   u32 name_off;  // into the string block
 };
+
+struct RangeRecord {
+  u64 hash;
+  f32 begin, end;
+  u32 name_off;  // into the string block
+  u32 pad;       // keep the record 8-aligned
+};
+
+// Start of the ranged-events block: derived, not stored. It sits immediately
+// after the (16-byte, already 8-aligned) point-event block.
+inline u64 RangedOffset(const Header& h) {
+  return (h.off_events + static_cast<u64>(h.num_events) * sizeof(EventRecord) + 7ull) & ~7ull;
+}
 
 struct RootKey {
   f32 time, x, y, z;
@@ -61,7 +81,10 @@ inline u16 QuantSigned(f32 v) {
 std::optional<Clip> Clip::FromBlob(const u8* data, size_t size) {
   if (!data || size < sizeof(Header)) return std::nullopt;
   const Header& h = Head(data);
-  if (h.magic != kMagic || h.version != kVersion) return std::nullopt;
+  if (h.magic != kMagic) return std::nullopt;
+  if (h.version != kVersion1 && h.version != kVersion2) return std::nullopt;
+  // v1 blobs never carry ranged events (the field was reserved padding).
+  if (h.version == kVersion1 && h.num_ranged != 0) return std::nullopt;
   if (h.total_size > size) return std::nullopt;
   if (h.num_anim_rot > h.num_tracks || h.num_anim_trans > h.num_tracks ||
       h.num_anim_scale > h.num_tracks) {
@@ -177,6 +200,41 @@ Vec3 Clip::RootDelta(f32 t0, f32 t1) const {
   return Vec3{end.x - at0.x + at1.x, end.y - at0.y + at1.y, end.z - at0.z + at1.z};
 }
 
+Vec3 Clip::RootDeltaLooped(f32 t0, f32 dt) const {
+  const f32 dur = duration();
+  if (dt <= 0.0f || dur <= 1e-6f) return Vec3{};
+  // Per-loop displacement (t=0 is the zero anchor, so this is the end value).
+  const Vec3 loop = RootTranslation(dur);
+  // Normalize the start into [0, dur).
+  f32 start = std::fmod(t0, dur);
+  if (start < 0) start += dur;
+  f32 remaining = dt;
+  Vec3 acc{};
+  const f32 to_end = dur - start;
+  if (remaining <= to_end) {
+    return RootDelta(start, start + remaining);  // no wrap needed
+  }
+  // Finish the current loop, then whole loops, then the trailing partial.
+  Vec3 e = RootTranslation(dur), s = RootTranslation(start);
+  acc = Vec3{e.x - s.x, e.y - s.y, e.z - s.z};
+  remaining -= to_end;
+  while (remaining >= dur) {
+    acc = Vec3{acc.x + loop.x, acc.y + loop.y, acc.z + loop.z};
+    remaining -= dur;
+  }
+  Vec3 tail = RootTranslation(remaining);  // from 0
+  return Vec3{acc.x + tail.x, acc.y + tail.y, acc.z + tail.z};
+}
+
+u32 Clip::num_ranged_events() const { return Head(blob_).num_ranged; }
+
+ClipRangedEvent Clip::RangedEvent(u32 index) const {
+  const Header& h = Head(blob_);
+  const RangeRecord& r = Block<RangeRecord>(blob_, RangedOffset(h))[index];
+  return ClipRangedEvent{r.hash, r.begin, r.end,
+                         reinterpret_cast<const char*>(blob_ + h.off_strings + r.name_off)};
+}
+
 ClipEvent Clip::Event(u32 index) const {
   const Header& h = Head(blob_);
   const EventRecord& r = Block<EventRecord>(blob_, h.off_events)[index];
@@ -207,6 +265,10 @@ void ClipBuilder::SetSample(u32 frame, u32 track, const Vec3& t, const Quat& r, 
 
 void ClipBuilder::AddEvent(std::string_view name, f32 time) {
   events_.emplace_back(std::string(name), time);
+}
+
+void ClipBuilder::AddRangedEvent(std::string_view name, f32 begin, f32 end) {
+  ranged_.push_back({std::string(name), begin, end});
 }
 
 void ClipBuilder::AddRootKey(f32 time, const Vec3& translation) {
@@ -305,6 +367,16 @@ std::vector<u8> ClipBuilder::Build() const {
   }
   std::sort(events.begin(), events.end(),
             [](const EventRecord& a, const EventRecord& b) { return a.time < b.time; });
+  // Ranged-event records share the string block (names appended after the point
+  // events'). Empty here => the blob stays a byte-identical v1 build.
+  std::vector<RangeRecord> ranged;
+  for (const auto& re : ranged_) {
+    ranged.push_back({HashName(re.name), re.begin, re.end, static_cast<u32>(strings.size()), 0});
+    strings.insert(strings.end(), re.name.begin(), re.name.end());
+    strings.push_back('\0');
+  }
+  std::sort(ranged.begin(), ranged.end(),
+            [](const RangeRecord& a, const RangeRecord& b) { return a.begin < b.begin; });
   std::vector<RootKey> roots;
   for (const auto& [time, v] : root_keys_) roots.push_back({time, v.x, v.y, v.z});
   std::sort(roots.begin(), roots.end(),
@@ -313,7 +385,7 @@ std::vector<u8> ClipBuilder::Build() const {
   // Assemble: header, then 8-aligned blocks.
   Header h{};
   h.magic = kMagic;
-  h.version = kVersion;
+  h.version = ranged.empty() ? kVersion1 : kVersion2;
   h.num_tracks = tracks_;
   h.num_frames = frames_;
   h.frame_rate = rate_;
@@ -324,6 +396,7 @@ std::vector<u8> ClipBuilder::Build() const {
   h.num_anim_scale = static_cast<u32>(anim_scale.size());
   h.num_events = static_cast<u32>(events.size());
   h.num_root_keys = static_cast<u32>(roots.size());
+  h.num_ranged = static_cast<u32>(ranged.size());
 
   std::vector<u8> blob(sizeof(Header));
   auto append = [&blob](const void* data, size_t bytes) -> u64 {
@@ -351,6 +424,14 @@ std::vector<u8> ClipBuilder::Build() const {
   h.off_scale_keys = append(scale_keys.data(), scale_keys.size() * sizeof(u16));
   h.off_root_keys = append(roots.data(), roots.size() * sizeof(RootKey));
   h.off_events = append(events.data(), events.size() * sizeof(EventRecord));
+  // Ranged block (v2 only) sits between the point-event and string blocks so the
+  // loader can derive its offset from off_events; omit it entirely for v1 so the
+  // byte layout is unchanged.
+  if (!ranged.empty()) {
+    u64 at = append(ranged.data(), ranged.size() * sizeof(RangeRecord));
+    assert(at == RangedOffset(h));
+    (void)at;
+  }
   h.off_strings = append(strings.data(), strings.size());
   h.total_size = blob.size();
   std::memcpy(blob.data(), &h, sizeof(Header));

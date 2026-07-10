@@ -121,6 +121,23 @@ struct ClipEvent {
   const char* name = nullptr;  // points into the clip blob
 };
 
+// A ranged event ("notify state"): a named span [begin, end] in clip time.
+struct ClipRangedEvent {
+  u64 name_hash = 0;
+  f32 begin = 0, end = 0;
+  const char* name = nullptr;  // points into the clip blob
+};
+
+// Which edge of a ranged event a query step straddled.
+enum class RangePhase : u8 { kEnter, kActive, kExit };
+
+// True when a point `v` falls in the half-open step (t0, t1]; when t1 < t0 the
+// step wraps through the clip end (looped playback). Shared by the point and
+// ranged event queries.
+inline bool StepContains(f32 v, f32 t0, f32 t1) {
+  return t1 >= t0 ? (v > t0 && v <= t1) : (v > t0 || v <= t1);
+}
+
 // Non-owning validated view over a clip blob (see ClipBuilder::Build for the
 // layout). Blobs are relocatable and mmap-friendly: load bytes, call FromBlob.
 class Clip {
@@ -140,6 +157,12 @@ class Clip {
   // key). Delta between two times, wrapping through the end when t1 < t0.
   Vec3 RootTranslation(f32 time) const;
   Vec3 RootDelta(f32 t0, f32 t1) const;
+  // Root translation swept by advancing forward from `t0` for `dt` seconds with
+  // looping over duration(). Unlike RootDelta (a single wrap), this accumulates
+  // whole-loop displacement when dt exceeds the remaining/whole duration, so a
+  // large timestep still yields the full travelled distance. Stored root keys
+  // are translation-only (no rotation), so only translation is reported.
+  Vec3 RootDeltaLooped(f32 t0, f32 dt) const;
 
   u32 num_events() const;
   ClipEvent Event(u32 index) const;
@@ -151,6 +174,27 @@ class Clip {
       ClipEvent e = Event(i);
       bool hit = t1 >= t0 ? (e.time > t0 && e.time <= t1) : (e.time > t0 || e.time <= t1);
       if (hit) fn(e);
+    }
+  }
+
+  // Ranged (notify-state) events. v1 clips have none (num_ranged_events()==0).
+  u32 num_ranged_events() const;
+  ClipRangedEvent RangedEvent(u32 index) const;
+  // Reports, per ranged event, the phase(s) its span crosses over the step
+  // (t0, t1] (loop-aware, same wrap rule as EventsInRange): kEnter when the
+  // begin edge is crossed, kExit when the end edge is crossed, kActive when the
+  // sample point t1 lies inside [begin, end) and the span is not exiting this
+  // step. Assumes dt <= duration per call (single wrap), like EventsInRange.
+  template <typename Fn>
+  void RangedEventsInRange(f32 t0, f32 t1, Fn&& fn) const {
+    for (u32 i = 0; i < num_ranged_events(); ++i) {
+      ClipRangedEvent r = RangedEvent(i);
+      bool enter = StepContains(r.begin, t0, t1);
+      bool exit = StepContains(r.end, t0, t1);
+      bool inside = r.begin <= t1 && t1 < r.end;
+      if (enter) fn(r, RangePhase::kEnter);
+      if (inside && !exit) fn(r, RangePhase::kActive);
+      if (exit) fn(r, RangePhase::kExit);
     }
   }
 
@@ -184,11 +228,19 @@ class ClipBuilder {
   void SetSample(u32 frame, u32 track, const Vec3& t, const Quat& r, f32 s);
   void SetAdditive(bool additive) { additive_ = additive; }
   void AddEvent(std::string_view name, f32 time);
+  // Ranged event (notify state): a named span [begin, end] in clip seconds.
+  // Adding any ranged event promotes the blob to v2; a clip with none stays
+  // byte-identical to a v1 build (see Build).
+  void AddRangedEvent(std::string_view name, f32 begin, f32 end);
   // Sparse cumulative root-motion keys (time, displacement-from-start).
   void AddRootKey(f32 time, const Vec3& translation);
   std::vector<u8> Build() const;
 
  private:
+  struct RangedEntry {
+    std::string name;
+    f32 begin, end;
+  };
   u32 tracks_, frames_;
   f32 rate_;
   bool additive_ = false;
@@ -196,6 +248,7 @@ class ClipBuilder {
   std::vector<Quat> r_;
   std::vector<f32> s_;
   std::vector<std::pair<std::string, f32>> events_;
+  std::vector<RangedEntry> ranged_;
   std::vector<std::pair<f32, Vec3>> root_keys_;
 };
 
@@ -380,6 +433,182 @@ class SyncGroup {
   std::vector<Track> tracks_;
   u32 markers_ = 0;
   f32 phase_ = 0;  // global marker-phase in [0, markers_)
+};
+
+// ---------------------------------------------------------------------------
+// Animation state machine: a compiled, data-driven graph in the same flat
+// idiom as the rest of kinema. States reference a pose source (a clip, a blend
+// space or a caller-provided program fragment) that is compiled into one shared
+// PoseOp template; transitions carry an AND-list of condition atoms over the
+// live PoseParams block (plus edge triggers the machine owns and consumes), a
+// blend duration, an optional normalized exit-time window and an interruption
+// policy. Compile once (StateMachineBuilder -> StateMachine), then drive one
+// StateMachineInstance per actor with Update(). Transitions are inertialized:
+// only the target state's program is evaluated each frame while the captured
+// pose offset decays - there is never a second graph walked in the hot path.
+
+// One clause of a transition condition. Comparison atoms read a live value from
+// the PoseParams block; trigger atoms test an edge flag the instance owns.
+struct ConditionAtom {
+  enum class Test : u8 { kLess, kGreater, kEqual, kNotEqual, kTrigger };
+  Test test = Test::kGreater;
+  i16 param = -1;  // PoseParams index (comparisons) or trigger id 0..63 (kTrigger)
+  f32 value = 0;   // threshold (comparisons); kEqual/kNotEqual use a small epsilon
+
+  static ConditionAtom Less(i16 p, f32 v) { return {Test::kLess, p, v}; }
+  static ConditionAtom Greater(i16 p, f32 v) { return {Test::kGreater, p, v}; }
+  static ConditionAtom Equal(i16 p, f32 v) { return {Test::kEqual, p, v}; }
+  static ConditionAtom NotEqual(i16 p, f32 v) { return {Test::kNotEqual, p, v}; }
+  static ConditionAtom Trigger(i16 id) { return {Test::kTrigger, id, 0}; }
+};
+
+// Whether a transition may fire while another transition is still blending.
+enum class InterruptPolicy : u8 {
+  kWaitForCompletion = 0,  // ignored until the active blend finishes
+  kInterruptible = 1,      // fires mid-blend, re-inertializing from the current pose
+};
+
+struct TransitionDesc {
+  f32 duration = 0.15f;  // inertialization / blend seconds
+  f32 exit_min = -1.0f;  // normalized source phase [0,1] gate; <0 disables the gate
+  f32 exit_max = -1.0f;
+  InterruptPolicy policy = InterruptPolicy::kWaitForCompletion;
+};
+
+// Point + ranged event sink used by StateMachineInstance::Update. Plain function
+// pointers keep it exception/RTTI/alloc free and usable across translation
+// units (Update is compiled in the library).
+struct EventCallback {
+  void* user = nullptr;
+  void (*point)(void* user, const ClipEvent&) = nullptr;
+  void (*ranged)(void* user, const ClipRangedEvent&, RangePhase) = nullptr;
+};
+
+class StateMachineBuilder;
+
+// Compiled, immutable state-machine definition. Shared across all actors of an
+// archetype; carries no per-actor state.
+class StateMachine {
+ public:
+  static constexpr u16 kAnyState = 0xFFFF;
+  u32 bones() const { return bones_; }
+  u16 state_count() const { return static_cast<u16>(states_.size()); }
+  u32 max_registers() const { return max_regs_; }  // arena registers Update needs
+
+ private:
+  friend class StateMachineBuilder;
+  friend class StateMachineInstance;
+  struct State {
+    u32 ops_begin = 0, ops_count = 0;
+    i16 clock_op = -1;       // op whose .time carries the state clock (-1 = none)
+    bool loop = true;
+    bool phase_clock = false;  // true: clock maps to normalized phase [0,1]
+    f32 loop_duration = 0;     // wrap period for the clock (clip seconds, or 1)
+    f32 speed = 1.0f;
+    const Clip* clip = nullptr;         // event source (may be null)
+    const Clip* root_source = nullptr;  // root-motion source (may be null)
+  };
+  struct Transition {
+    u16 from = 0, to = 0;
+    u32 cond_begin = 0, cond_count = 0;
+    f32 duration = 0.15f, exit_min = -1.0f, exit_max = -1.0f;
+    InterruptPolicy policy = InterruptPolicy::kWaitForCompletion;
+  };
+  u32 bones_ = 0, max_regs_ = 1;
+  std::vector<State> states_;
+  std::vector<Transition> transitions_;
+  std::vector<ConditionAtom> conds_;
+  std::vector<PoseOp> ops_;  // template ops; states slice into this
+};
+
+// Builds a StateMachine. Each Add*State returns the new state's id (its index).
+class StateMachineBuilder {
+ public:
+  explicit StateMachineBuilder(u32 bones) { bones_ = bones; }
+
+  // A state that samples one clip on its own clock. loop wraps by the clip's
+  // duration; speed scales the clock.
+  u16 AddClipState(const Clip* clip, bool loop = true, f32 speed = 1.0f);
+  // A state driven by a blend space; the state clock feeds the normalized phase
+  // and params[coord_param] (and +1 in 2D) the coordinate. root_source (if any)
+  // supplies root motion and clip events.
+  u16 AddBlendSpaceState(const BlendSpace* space, i16 coord_param, bool loop = true,
+                         f32 speed = 1.0f, const Clip* root_source = nullptr);
+  // A state from a caller-provided program fragment (ops are copied in). If one
+  // op should carry the state clock, pass its index in clock_op (its .time is
+  // patched each frame) and the wrap period in loop_duration; pass -1/0 for a
+  // static fragment. reg_count is the number of arena registers the fragment
+  // uses; its result must be its last op's dst. clip supplies events/root.
+  u16 AddProgramState(const PoseOp* ops, u32 count, u32 reg_count, i16 clock_op,
+                      f32 loop_duration, bool loop = true, f32 speed = 1.0f,
+                      const Clip* clip = nullptr, const Clip* root_source = nullptr);
+
+  // from == StateMachine::kAnyState applies the transition from every state.
+  // Conditions are ANDed; an empty list is always-true (guarded by exit-time).
+  void AddTransition(u16 from, u16 to, const TransitionDesc& desc,
+                     const ConditionAtom* conds = nullptr, u32 cond_count = 0);
+
+  StateMachine Build() const;
+
+ private:
+  u32 bones_ = 0;
+  StateMachine sm_;
+};
+
+// Per-actor runtime state. Small and cheap to hold; the only heap use is a
+// one-time Init sizing of the capture buffers and op scratch (no per-frame
+// allocation). Advance and evaluate with Update().
+class StateMachineInstance {
+ public:
+  void Init(const StateMachine& def, u16 start_state = 0);
+
+  // Raise an edge trigger (0..63). It stays raised until a transition whose
+  // condition consumes it fires, then auto-resets.
+  void SetTrigger(u16 id) {
+    if (id < 64) triggers_ |= (1ull << id);
+  }
+  bool trigger(u16 id) const { return id < 64 && (triggers_ & (1ull << id)) != 0; }
+
+  // Advance the machine by dt, evaluate conditions, fire at most one transition
+  // (inertialized), and write this frame's pose into out through the program
+  // model. arena must hold at least def.max_registers() registers; out is a
+  // separate bones-sized view the pose is written to (and returned). An optional
+  // event sink receives the active state's point/ranged events; on a transition
+  // the exiting state's still-open ranges are force-reported as kExit.
+  PoseView Update(f32 dt, const PoseParams& params, PoseArena& arena, PoseView out,
+                  const EventCallback* events = nullptr);
+
+  u16 state() const { return current_; }
+  bool transitioning() const { return xfade_dur_ > 0; }
+  f32 transition_alpha() const {
+    return xfade_dur_ > 0 ? (xfade_t_ / xfade_dur_) : 1.0f;
+  }
+  f32 state_time() const { return time_; }
+  // This frame's root translation delta (loop-aware; blended across an active
+  // transition by transition progress). Valid after Update().
+  Vec3 RootMotion() const { return root_; }
+  const Inertializer& inertializer() const { return inert_; }
+
+ private:
+  PoseView RunState(u16 s, f32 clock, const PoseParams& params, PoseArena& arena);
+  bool CondsPass(const StateMachine::Transition& tr, const PoseParams& params) const;
+  f32 NormalizedPhase(u16 s, f32 t) const;
+  int SelectTransition(const PoseParams& params) const;
+  PoseView FromView();
+  void EmitEvents(u16 s, f32 t0, f32 t1, const EventCallback* ev) const;
+  void ForceExitOpenRanges(u16 s, f32 clock, const EventCallback* ev) const;
+
+  const StateMachine* def_ = nullptr;
+  u16 current_ = 0, from_ = 0;
+  f32 time_ = 0, from_time_ = 0;
+  f32 xfade_t_ = 0, xfade_dur_ = 0;
+  u64 triggers_ = 0;
+  Vec3 root_{};
+  Inertializer inert_;
+  std::vector<Vec3> from_t_;
+  std::vector<Quat> from_r_;
+  std::vector<f32> from_s_;
+  std::vector<PoseOp> scratch_ops_;
 };
 
 }  // namespace kinema
