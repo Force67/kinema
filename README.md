@@ -41,6 +41,27 @@ kinds and precomputed structures, never node-object trees walked at runtime:
 - **Per-frame parameters** (`PoseParams`): programs compile once per
   archetype; ops carrying a `*_param` index read live times/alphas/coords from
   a parameter block each frame, so nothing is reallocated to animate.
+- **State machine** (`StateMachineBuilder` -> `StateMachine` +
+  `StateMachineInstance`): a compiled, data-driven graph. States reference a
+  pose source (clip / blend space / caller program fragment) baked into one
+  shared `PoseOp` template; transitions carry an AND-list of condition atoms
+  over the `PoseParams` block (plus edge triggers the instance owns and
+  consumes), a blend duration, an optional normalized exit-time window and an
+  interruption policy. `Update()` advances one instance per actor, patches the
+  active state's clock into the template and evaluates it through the program
+  model. Transitions are **inertialized** - it captures the current pose as the
+  offset source and decays it, so still only one graph is walked.
+- **Root motion**: `Clip::RootDeltaLooped(t0, dt)` sweeps the sparse cumulative
+  root keys forward with loop wrap and multi-loop accumulation (`dt` may exceed
+  the duration); keys are translation-only. The state machine reports the
+  frame's delta (`RootMotion()`) blended across an active transition by its
+  progress.
+- **Ranged events** ("notify states"): `AddRangedEvent(name, begin, end)` plus
+  a loop-aware `RangedEventsInRange` query that reports enter/active/exit per
+  span over a step. The state machine routes them per frame and force-exits a
+  leaving state's still-open ranges on a transition. Ranged events promote a
+  clip to a v2 blob; a clip with none is byte-identical to a v1 build and the
+  loader accepts both.
 
 ## Use
 
@@ -86,6 +107,21 @@ sync.AddClip(*walk.get());  // markers = the clip's events
 sync.AddClip(*run.get());
 sync.Advance(dt, /*leader=*/0);
 params[0] = sync.LocalTime(0);  // per-clip, foot-aligned sample times
+
+// State machine: compile once, drive one instance per actor.
+kinema::StateMachineBuilder smb(num_bones);
+kinema::u16 idle = smb.AddClipState(idle_clip.get());
+kinema::u16 run = smb.AddClipState(run_clip.get());
+kinema::ConditionAtom go = kinema::ConditionAtom::Greater(/*param=*/0, 3.0f);
+smb.AddTransition(idle, run, {.duration = 0.2f}, &go, 1);   // speed>3 -> run
+kinema::StateMachine machine = smb.Build();
+
+kinema::StateMachineInstance actor;
+actor.Init(machine, idle);
+kinema::PoseArena sm_arena(num_bones, machine.max_registers());
+// Per frame: conditions fire an inertialized transition; one graph is walked.
+kinema::PoseView pose = actor.Update(dt, pp, sm_arena, out_pose);
+character.Move(actor.RootMotion());   // loop-aware, transition-blended
 ```
 
 Jolt integration (`kinema/jolt_adapter.h`, header-only, include where Jolt
