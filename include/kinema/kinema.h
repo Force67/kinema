@@ -213,23 +213,116 @@ void BlendPosesMasked(ConstPoseView a, ConstPoseView b, f32 alpha, const f32* ma
 void ApplyAdditive(ConstPoseView base, ConstPoseView add, f32 weight, PoseView dst);
 
 // ---------------------------------------------------------------------------
+// Additive bake: turn a clip into an additive (delta) clip at build time.
+//
+// An additive clip stores, per frame, the source pose's delta from a reference
+// pose: rotation delta = ref^-1 * src, translation delta = src - ref, scale
+// delta = src / ref. Composed back over the reference with ApplyAdditive (or a
+// kAdditive op) at weight 1 it reproduces the source (within quantization). The
+// result is an ordinary clip blob with the additive flag set - no format
+// change; the runtime samples it exactly like any other clip.
+OwnedClip MakeAdditiveClip(const Clip& source, ConstPoseView reference);
+// Reference = the source's own first frame (the common "additive from base
+// pose" case for layered gestures on top of a neutral stance).
+OwnedClip MakeAdditiveClipFromFirstFrame(const Clip& source);
+
+// ---------------------------------------------------------------------------
+// Bone masks: SoA per-bone blend weights for kBlendMasked / BlendPosesMasked.
+// Built once (builder time), the op points at data(); the hot path just reads
+// the array. Hierarchy-aware helpers fill a joint and optionally its whole
+// subtree using the skeleton's parent table.
+class BoneMask {
+ public:
+  BoneMask() = default;
+  explicit BoneMask(u32 bones, f32 fill = 0.0f) { Init(bones, fill); }
+  void Init(u32 bones, f32 fill = 0.0f);
+  void Fill(f32 weight);
+  void Set(u32 bone, f32 weight);
+  // Set `weight` on `bone`; with `descendants`, on every joint below it too
+  // (parents precede children, so a single forward sweep suffices).
+  void SetChain(const Skeleton& skeleton, u32 bone, f32 weight, bool descendants = true);
+  const f32* data() const { return weights_.data(); }
+  u32 size() const { return static_cast<u32>(weights_.size()); }
+
+ private:
+  std::vector<f32> weights_;
+};
+
+// ---------------------------------------------------------------------------
+// Blend spaces: parameterized blending over clips placed at coordinates. 1D
+// (e.g. speed -> walk/jog/run) brackets the two neighbouring clips and lerps.
+// 2D (e.g. direction x speed strafe set) uses gradient-band interpolation.
+//
+// Host-owned config, compiled once; a kBlendSpace op points at it. Every
+// contributing clip is sampled at a shared normalized phase [0,1], so
+// differently-timed locomotion clips stay phase-matched through the blend. The
+// runtime query is allocation-free and O(clips) (clips are few).
+class BlendSpace {
+ public:
+  enum class Dim : u8 { k1D = 0, k2D = 1 };
+  BlendSpace() = default;
+  explicit BlendSpace(Dim dim) : dim_(dim) {}
+  BlendSpace& Add(const Clip* clip, f32 x, f32 y = 0.0f);  // 1D ignores y
+  void Finalize();  // sorts 1D samples ascending by x (no-op for 2D)
+
+  Dim dim() const { return dim_; }
+  u32 count() const { return static_cast<u32>(clips_.size()); }
+  const Clip* clip(u32 i) const { return clips_[i]; }
+  f32 x(u32 i) const { return x_[i]; }
+  f32 y(u32 i) const { return y_[i]; }
+
+ private:
+  Dim dim_ = Dim::k1D;
+  std::vector<const Clip*> clips_;
+  std::vector<f32> x_, y_;
+};
+
+// Evaluate a blend space into `dst` at coordinate (x[,y]) and normalized phase,
+// using `scratch` as one temporary register. dst/scratch track counts must
+// match the clips'. Exposed so hosts can drive it directly; kBlendSpace ops
+// call it internally.
+void EvalBlendSpace(const BlendSpace& space, f32 x, f32 y, f32 phase, PoseView dst,
+                    PoseView scratch);
+
+// ---------------------------------------------------------------------------
+// Per-frame parameter block. Programs compile once; any op that carries a
+// *_param index >= 0 reads that value from here each frame instead of from its
+// own immediate, so times/alphas/coordinates change without rebuilding the
+// program.
+struct PoseParams {
+  const f32* values = nullptr;
+  u32 count = 0;
+  f32 Get(int idx, f32 fallback) const {
+    return (idx >= 0 && static_cast<u32>(idx) < count) ? values[idx] : fallback;
+  }
+};
+
+// ---------------------------------------------------------------------------
 // Compiled pose program: a flat op list over arena registers. Hosts compile
 // their blend tree / state machine into this once per structural change and
-// just patch times/alphas per frame.
+// just patch times/alphas per frame (directly, or via a PoseParams block).
 
 struct PoseOp {
-  enum class Kind : u8 { kSample, kCopy, kBlend, kBlendMasked, kAdditive };
+  enum class Kind : u8 { kSample, kCopy, kBlend, kBlendMasked, kAdditive, kBlendSpace };
   Kind kind = Kind::kCopy;
   u8 dst = 0, a = 0, b = 0;
   const Clip* clip = nullptr;  // kSample
-  f32 time = 0;                // kSample
+  f32 time = 0;                // kSample time / kBlendSpace normalized phase [0,1]
   f32 alpha = 0;               // kBlend*/kAdditive weight
   const f32* mask = nullptr;   // kBlendMasked, per-bone weights
+  // Extensions below are append-only: existing designated-initializer call
+  // sites keep compiling because they only name the fields above.
+  const BlendSpace* space = nullptr;  // kBlendSpace; uses register `a` as scratch
+  i16 time_param = -1;                // >=0: overrides `time`/phase from PoseParams
+  i16 alpha_param = -1;               // >=0: overrides `alpha` from PoseParams
+  i16 coord_param = -1;               // kBlendSpace: params[coord_param]=x, +1=y (2D)
 };
 
 // Executes ops in order against arena registers 0..N and returns the view of
-// the last op's dst. The arena must hold max(dst,a,b)+1 registers.
-PoseView ExecuteProgram(const PoseOp* ops, size_t count, PoseArena& arena);
+// the last op's dst. The arena must hold max(dst,a,b)+1 registers. Pass a
+// PoseParams block to resolve any *_param bindings; omit it to use immediates.
+PoseView ExecuteProgram(const PoseOp* ops, size_t count, PoseArena& arena,
+                        const PoseParams* params = nullptr);
 
 // ---------------------------------------------------------------------------
 // Inertialization: on a state switch, capture the offset between the pose the
@@ -250,6 +343,43 @@ class Inertializer {
   std::vector<Vec3> dr_;  // rotation offsets, axis*angle
   std::vector<f32> ds_;
   f32 remaining_ = 0, duration_ = 0;
+};
+
+// ---------------------------------------------------------------------------
+// Sync groups: keep phase-matched clips (walk <-> run) foot-synced across a
+// blend. Each clip contributes a sorted marker track - its named events, e.g.
+// footfalls - and all clips in a group must share the same marker count. A
+// single global marker-phase advances on the current leader's clock; every
+// clip's local sample time is read back at that phase, so followers are
+// time-scaled to hit their k-th marker together with the leader. Feed the
+// resulting LocalTime values into kSample ops (directly or via a PoseParams
+// block) and one graph stays synced even as blend weights shift.
+class SyncGroup {
+ public:
+  void Clear();
+  // Markers = all of the clip's events, sorted by time.
+  void AddClip(const Clip& clip);
+  // Explicit markers (seconds, sorted internally); marker_count must match the
+  // clips already in the group.
+  void AddClipMarkers(const f32* marker_times, u32 marker_count, f32 duration);
+  void Reset(f32 phase = 0.0f);
+  // Advance the shared phase by dt seconds measured on `leader`'s clock.
+  void Advance(f32 dt, u32 leader, f32 play_rate = 1.0f);
+
+  f32 LocalTime(u32 clip) const;  // seconds into `clip` at the current phase
+  f32 phase() const { return phase_; }
+  u32 marker_count() const { return markers_; }
+  u32 clip_count() const { return static_cast<u32>(tracks_.size()); }
+
+ private:
+  struct Track {
+    std::vector<f32> markers;
+    f32 duration = 0;
+  };
+  f32 MarkerTime(const Track& t, f32 g) const;
+  std::vector<Track> tracks_;
+  u32 markers_ = 0;
+  f32 phase_ = 0;  // global marker-phase in [0, markers_)
 };
 
 }  // namespace kinema

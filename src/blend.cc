@@ -153,27 +153,39 @@ void ApplyAdditive(ConstPoseView base, ConstPoseView add, f32 weight, PoseView d
 // ---------------------------------------------------------------------------
 // Program
 
-PoseView ExecuteProgram(const PoseOp* ops, size_t count, PoseArena& arena) {
+PoseView ExecuteProgram(const PoseOp* ops, size_t count, PoseArena& arena,
+                        const PoseParams* params) {
   PoseView last{};
   for (size_t i = 0; i < count; ++i) {
     const PoseOp& op = ops[i];
     PoseView dst = arena.At(op.dst);
+    // Per-frame inputs: an op's immediate is the default; a *_param index >= 0
+    // pulls the live value from the parameter block instead.
+    const f32 time = params ? params->Get(op.time_param, op.time) : op.time;
+    const f32 alpha = params ? params->Get(op.alpha_param, op.alpha) : op.alpha;
     switch (op.kind) {
       case PoseOp::Kind::kSample:
-        op.clip->Sample(op.time, dst);
+        op.clip->Sample(time, dst);
         break;
       case PoseOp::Kind::kCopy:
         CopyPose(arena.At(op.a), dst);
         break;
       case PoseOp::Kind::kBlend:
-        BlendPoses(arena.At(op.a), arena.At(op.b), op.alpha, dst);
+        BlendPoses(arena.At(op.a), arena.At(op.b), alpha, dst);
         break;
       case PoseOp::Kind::kBlendMasked:
-        BlendPosesMasked(arena.At(op.a), arena.At(op.b), op.alpha, op.mask, dst);
+        BlendPosesMasked(arena.At(op.a), arena.At(op.b), alpha, op.mask, dst);
         break;
       case PoseOp::Kind::kAdditive:
-        ApplyAdditive(arena.At(op.a), arena.At(op.b), op.alpha, dst);
+        ApplyAdditive(arena.At(op.a), arena.At(op.b), alpha, dst);
         break;
+      case PoseOp::Kind::kBlendSpace: {
+        const f32 cx = params ? params->Get(op.coord_param, 0.0f) : 0.0f;
+        const f32 cy = params ? params->Get(op.coord_param >= 0 ? op.coord_param + 1 : -1, 0.0f)
+                              : 0.0f;
+        EvalBlendSpace(*op.space, cx, cy, time, dst, arena.At(op.a));
+        break;
+      }
     }
     last = dst;
   }
