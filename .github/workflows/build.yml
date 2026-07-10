@@ -1,0 +1,20 @@
+name: build
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: configure
+        run: cmake -B build -DKINEMA_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release
+      - name: build
+        run: cmake --build build --config Release
+      - name: test
+        run: ctest --test-dir build -C Release --output-on-failure
