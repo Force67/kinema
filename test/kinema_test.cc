@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <tuple>
 #include <vector>
 
 #include "kinema/kinema.h"
@@ -466,6 +467,351 @@ void TestProgramParams() {
   CHECK_NEAR(out.translation[0].x, 9.0f, 1e-4f);
 }
 
+// A longer constant clip with a chosen duration (frames at 30 fps), used to
+// drive state clocks and exit-time windows deterministically.
+OwnedClip MakeClipDur(f32 val, f32 dur, u32 tracks = 1) {
+  u32 frames = static_cast<u32>(std::round(dur * 30.0f)) + 1;
+  ClipBuilder b(tracks, frames, 30.0f);
+  for (u32 f = 0; f < frames; ++f)
+    for (u32 t = 0; t < tracks; ++t) b.SetSample(f, t, Vec3{val, 0, 0}, Quat{}, 1);
+  return OwnedClip(b.Build());
+}
+
+// Constant-pose clip with a linear +x root ramp (speed vx over duration dur).
+OwnedClip MakeMoverClip(f32 vx, f32 dur) {
+  u32 frames = static_cast<u32>(std::round(dur * 30.0f)) + 1;
+  ClipBuilder b(1, frames, 30.0f);
+  for (u32 f = 0; f < frames; ++f) b.SetSample(f, 0, Vec3{0, 0, 0}, Quat{}, 1);
+  b.AddRootKey(dur * 0.5f, Vec3{vx * dur * 0.5f, 0, 0});
+  b.AddRootKey(dur, Vec3{vx * dur, 0, 0});
+  return OwnedClip(b.Build());
+}
+
+void TestRootMotionLoop() {
+  OwnedClip clip = MakeMoverClip(10.0f, 1.0f);  // duration 1s, 10 u/s along +x
+  CHECK_NEAR(clip->duration(), 1.0f, 1e-4f);
+  CHECK_NEAR(clip->RootTranslation(0.5f).x, 5.0f, 1e-3f);
+
+  // No wrap: straightforward forward advance.
+  CHECK_NEAR(clip->RootDeltaLooped(0.2f, 0.3f).x, 3.0f, 1e-3f);
+  // Wrap over the loop seam (t1 < t0 modulo duration): 0.8 -> end (2) + 0..0.2 (2).
+  CHECK_NEAR(clip->RootDeltaLooped(0.8f, 0.4f).x, 4.0f, 1e-3f);
+  CHECK_NEAR(clip->RootDelta(0.8f, 0.2f).x, 4.0f, 1e-3f);  // agree with single-wrap form
+  // Multi-loop: dt greater than the duration accumulates whole-loop travel.
+  CHECK_NEAR(clip->RootDeltaLooped(0.0f, 2.5f).x, 25.0f, 1e-2f);
+  CHECK_NEAR(clip->RootDeltaLooped(0.5f, 3.0f).x, 30.0f, 1e-2f);
+}
+
+void TestRangedEvents() {
+  // A v1 clip carries no ranged events and still loads.
+  OwnedClip plain = MakeClipDur(0.0f, 1.0f);
+  CHECK(plain->num_ranged_events() == 0);
+
+  ClipBuilder b(1, 31, 30.0f);
+  for (u32 f = 0; f < 31; ++f) b.SetSample(f, 0, Vec3{0, 0, 0}, Quat{}, 1);
+  b.AddRangedEvent("Attack", 0.3f, 0.7f);
+  b.AddRangedEvent("Early", 0.05f, 0.2f);
+  b.AddRangedEvent("Late", 0.8f, 0.95f);
+  OwnedClip clip(b.Build());
+  CHECK(static_cast<bool>(clip));
+  CHECK(clip->num_ranged_events() == 3);
+
+  // Blob relocatability with the v2 ranged block.
+  std::vector<u8> copy(clip.bytes());
+  auto view = Clip::FromBlob(copy.data(), copy.size());
+  CHECK(view.has_value());
+  CHECK(view->num_ranged_events() == 3);
+
+  auto phases = [&](f32 t0, f32 t1, u64 want_hash) {
+    bool enter = false, active = false, exit = false;
+    clip->RangedEventsInRange(t0, t1, [&](const ClipRangedEvent& r, RangePhase p) {
+      if (r.name_hash != want_hash) return;
+      if (p == RangePhase::kEnter) enter = true;
+      if (p == RangePhase::kActive) active = true;
+      if (p == RangePhase::kExit) exit = true;
+    });
+    return std::make_tuple(enter, active, exit);
+  };
+  const u64 kAttack = HashName("Attack");
+  // Enter step: begin crossed, sample inside -> enter + active, no exit.
+  auto [e0, a0, x0] = phases(0.2f, 0.4f, kAttack);
+  CHECK(e0 && a0 && !x0);
+  // Middle step: purely active.
+  auto [e1, a1, x1] = phases(0.4f, 0.6f, kAttack);
+  CHECK(!e1 && a1 && !x1);
+  // Exit step: end crossed, sample past the span -> exit only.
+  auto [e2, a2, x2] = phases(0.6f, 0.8f, kAttack);
+  CHECK(!e2 && !a2 && x2);
+
+  // Loop wrap over the seam (0.9 -> 0.1): "Late" exits at the end, "Early"
+  // enters just after the wrap.
+  auto [le, la, lx] = phases(0.9f, 0.1f, HashName("Late"));
+  CHECK(!le && !la && lx);
+  auto [ee, ea, ex] = phases(0.9f, 0.1f, HashName("Early"));
+  CHECK(ee && ea && !ex);
+}
+
+// Event sink that tallies routed events for the state machine tests.
+struct EventLog {
+  int point = 0, enter = 0, active = 0, exit = 0;
+  static void OnPoint(void* u, const ClipEvent&) { ++static_cast<EventLog*>(u)->point; }
+  static void OnRanged(void* u, const ClipRangedEvent&, RangePhase p) {
+    auto* self = static_cast<EventLog*>(u);
+    if (p == RangePhase::kEnter) ++self->enter;
+    if (p == RangePhase::kActive) ++self->active;
+    if (p == RangePhase::kExit) ++self->exit;
+  }
+};
+
+void TestStateMachine() {
+  OwnedClip a = MakeClipDur(0.0f, 1.0f), bClip = MakeClipDur(10.0f, 1.0f);
+
+  // 1) Condition-driven transition fires; inertializer engages exactly at switch.
+  {
+    StateMachineBuilder sb(1);
+    u16 A = sb.AddClipState(a.get());
+    u16 B = sb.AddClipState(bClip.get());
+    ConditionAtom cond = ConditionAtom::Greater(0, 0.5f);
+    sb.AddTransition(A, B, TransitionDesc{0.2f, -1, -1, InterruptPolicy::kWaitForCompletion},
+                     &cond, 1);
+    StateMachine def = sb.Build();
+    StateMachineInstance inst;
+    inst.Init(def, A);
+    PoseArena arena(1, def.max_registers());
+    PoseView out = PoseView{};
+    std::vector<Vec3> ot(1);
+    std::vector<Quat> orr(1);
+    std::vector<f32> os(1);
+    out = PoseView{ot.data(), orr.data(), os.data(), 1};
+
+    f32 p = 0.0f;
+    PoseParams params{&p, 1};
+    arena.Reset();
+    inst.Update(0.05f, params, arena, out);
+    CHECK(inst.state() == A);
+    CHECK(!inst.inertializer().active());
+
+    p = 1.0f;  // condition now true
+    arena.Reset();
+    inst.Update(0.05f, params, arena, out);
+    CHECK(inst.state() == B);
+    CHECK(inst.inertializer().active());  // engaged exactly at the switch
+    CHECK(inst.transitioning());
+  }
+
+  // 2) Exit-time window respected: transition gated to phase >= 0.5.
+  {
+    StateMachineBuilder sb(1);
+    u16 A = sb.AddClipState(a.get());
+    u16 B = sb.AddClipState(bClip.get());
+    ConditionAtom cond = ConditionAtom::Greater(0, 0.5f);
+    sb.AddTransition(A, B, TransitionDesc{0.1f, 0.5f, 1.0f, InterruptPolicy::kWaitForCompletion},
+                     &cond, 1);
+    StateMachine def = sb.Build();
+    StateMachineInstance inst;
+    inst.Init(def, A);
+    PoseArena arena(1, def.max_registers());
+    std::vector<Vec3> ot(1);
+    std::vector<Quat> orr(1);
+    std::vector<f32> os(1);
+    PoseView out{ot.data(), orr.data(), os.data(), 1};
+    f32 p = 1.0f;  // condition always satisfied; only the exit window gates
+    PoseParams params{&p, 1};
+    f32 fire_time = -1.0f;
+    for (int i = 0; i < 12 && fire_time < 0; ++i) {
+      arena.Reset();
+      inst.Update(0.1f, params, arena, out);
+      if (inst.state() == B) fire_time = inst.state_time();  // fired this step
+    }
+    CHECK(fire_time >= 0.0f);
+    // The machine was still in A until its phase reached 0.5, so the earliest
+    // fire happened at source phase >= 0.5 (state_time of A was >= 0.5).
+    // Only assert it did not fire in the first four 0.1s steps (phase < 0.5).
+  }
+
+  // Re-run the exit-window case but assert it stays in A while phase < 0.5.
+  {
+    StateMachineBuilder sb(1);
+    u16 A = sb.AddClipState(a.get());
+    u16 B = sb.AddClipState(bClip.get());
+    ConditionAtom cond = ConditionAtom::Greater(0, 0.5f);
+    sb.AddTransition(A, B, TransitionDesc{0.1f, 0.5f, 1.0f, InterruptPolicy::kWaitForCompletion},
+                     &cond, 1);
+    StateMachine def = sb.Build();
+    StateMachineInstance inst;
+    inst.Init(def, A);
+    PoseArena arena(1, def.max_registers());
+    std::vector<Vec3> ot(1);
+    std::vector<Quat> orr(1);
+    std::vector<f32> os(1);
+    PoseView out{ot.data(), orr.data(), os.data(), 1};
+    f32 p = 1.0f;
+    PoseParams params{&p, 1};
+    for (int i = 0; i < 4; ++i) {  // 4 * 0.1 = 0.4 < 0.5, gate closed
+      arena.Reset();
+      inst.Update(0.1f, params, arena, out);
+      CHECK(inst.state() == A);
+    }
+    arena.Reset();
+    inst.Update(0.1f, params, arena, out);  // now phase 0.5, gate opens
+    CHECK(inst.state() == B);
+  }
+
+  // 3) Trigger consumed exactly once.
+  {
+    StateMachineBuilder sb(1);
+    u16 A = sb.AddClipState(a.get());
+    u16 B = sb.AddClipState(bClip.get());
+    ConditionAtom cond = ConditionAtom::Trigger(0);
+    sb.AddTransition(A, B, TransitionDesc{0.1f}, &cond, 1);
+    StateMachine def = sb.Build();
+    StateMachineInstance inst;
+    inst.Init(def, A);
+    PoseArena arena(1, def.max_registers());
+    std::vector<Vec3> ot(1);
+    std::vector<Quat> orr(1);
+    std::vector<f32> os(1);
+    PoseView out{ot.data(), orr.data(), os.data(), 1};
+    PoseParams params{nullptr, 0};
+
+    arena.Reset();
+    inst.Update(0.05f, params, arena, out);
+    CHECK(inst.state() == A);  // no trigger yet
+    inst.SetTrigger(0);
+    CHECK(inst.trigger(0));
+    arena.Reset();
+    inst.Update(0.05f, params, arena, out);
+    CHECK(inst.state() == B);
+    CHECK(!inst.trigger(0));  // consumed on fire, auto-reset
+  }
+
+  // 4) Interruption policy honored (blocking vs interruptible mid-blend).
+  auto build_chain = [&](InterruptPolicy pol) {
+    StateMachineBuilder sb(1);
+    u16 A = sb.AddClipState(a.get());
+    u16 B = sb.AddClipState(bClip.get());
+    u16 C = sb.AddClipState(a.get());
+    ConditionAtom c0 = ConditionAtom::Greater(0, 0.5f);
+    ConditionAtom c1 = ConditionAtom::Greater(1, 0.5f);
+    sb.AddTransition(A, B, TransitionDesc{0.5f}, &c0, 1);  // long blend
+    sb.AddTransition(B, C, TransitionDesc{0.1f, -1, -1, pol}, &c1, 1);
+    return sb.Build();
+  };
+  {
+    StateMachine def = build_chain(InterruptPolicy::kWaitForCompletion);
+    StateMachineInstance inst;
+    inst.Init(def, 0);
+    PoseArena arena(1, def.max_registers());
+    std::vector<Vec3> ot(1);
+    std::vector<Quat> orr(1);
+    std::vector<f32> os(1);
+    PoseView out{ot.data(), orr.data(), os.data(), 1};
+    f32 buf[2] = {1.0f, 1.0f};  // both conditions true
+    PoseParams params{buf, 2};
+    arena.Reset();
+    inst.Update(0.05f, params, arena, out);  // A -> B (starts a 0.5s blend)
+    CHECK(inst.state() == 1);
+    arena.Reset();
+    inst.Update(0.05f, params, arena, out);  // mid-blend: B->C must wait
+    CHECK(inst.state() == 1);
+  }
+  {
+    StateMachine def = build_chain(InterruptPolicy::kInterruptible);
+    StateMachineInstance inst;
+    inst.Init(def, 0);
+    PoseArena arena(1, def.max_registers());
+    std::vector<Vec3> ot(1);
+    std::vector<Quat> orr(1);
+    std::vector<f32> os(1);
+    PoseView out{ot.data(), orr.data(), os.data(), 1};
+    f32 buf[2] = {1.0f, 1.0f};
+    PoseParams params{buf, 2};
+    arena.Reset();
+    inst.Update(0.05f, params, arena, out);  // A -> B
+    CHECK(inst.state() == 1);
+    arena.Reset();
+    inst.Update(0.05f, params, arena, out);  // mid-blend: B->C interrupts
+    CHECK(inst.state() == 2);
+  }
+
+  // 5) Forced exit routing: a transition mid-range exits the leaving state's
+  // open ranged event.
+  {
+    ClipBuilder ab(1, 31, 30.0f);
+    for (u32 f = 0; f < 31; ++f) ab.SetSample(f, 0, Vec3{0, 0, 0}, Quat{}, 1);
+    ab.AddRangedEvent("Guard", 0.05f, 1.0f);  // open across (almost) the whole clip
+    OwnedClip guarded(ab.Build());
+
+    StateMachineBuilder sb(1);
+    u16 A = sb.AddClipState(guarded.get());
+    u16 B = sb.AddClipState(bClip.get());
+    ConditionAtom cond = ConditionAtom::Greater(0, 0.5f);
+    sb.AddTransition(A, B, TransitionDesc{0.1f}, &cond, 1);
+    StateMachine def = sb.Build();
+    StateMachineInstance inst;
+    inst.Init(def, A);
+    PoseArena arena(1, def.max_registers());
+    std::vector<Vec3> ot(1);
+    std::vector<Quat> orr(1);
+    std::vector<f32> os(1);
+    PoseView out{ot.data(), orr.data(), os.data(), 1};
+    EventLog log;
+    EventCallback cb{&log, &EventLog::OnPoint, &EventLog::OnRanged};
+
+    f32 p = 0.0f;
+    PoseParams params{&p, 1};
+    arena.Reset();
+    inst.Update(0.1f, params, arena, out, &cb);  // inside the range, entered
+    CHECK(log.enter == 1);
+    CHECK(log.exit == 0);
+    p = 1.0f;
+    arena.Reset();
+    inst.Update(0.1f, params, arena, out, &cb);  // fire A->B mid-range
+    CHECK(inst.state() == B);
+    CHECK(log.exit == 1);  // leaving state's open range force-exited
+  }
+
+  // 6) Transition-blended root motion: on the fire frame the delta tracks the
+  // exiting (fast) state, then eases toward the entering (slow) state.
+  {
+    OwnedClip fast = MakeMoverClip(10.0f, 1.0f), slow = MakeMoverClip(2.0f, 1.0f);
+    StateMachineBuilder sb(1);
+    u16 A = sb.AddClipState(fast.get());
+    u16 B = sb.AddClipState(slow.get());
+    ConditionAtom cond = ConditionAtom::Greater(0, 0.5f);
+    sb.AddTransition(A, B, TransitionDesc{0.4f}, &cond, 1);
+    StateMachine def = sb.Build();
+    StateMachineInstance inst;
+    inst.Init(def, A);
+    PoseArena arena(1, def.max_registers());
+    std::vector<Vec3> ot(1);
+    std::vector<Quat> orr(1);
+    std::vector<f32> os(1);
+    PoseView out{ot.data(), orr.data(), os.data(), 1};
+
+    f32 p = 0.0f;
+    PoseParams params{&p, 1};
+    arena.Reset();
+    inst.Update(0.05f, params, arena, out);
+    CHECK_NEAR(inst.RootMotion().x, 10.0f * 0.05f, 1e-2f);  // pure fast state
+
+    p = 1.0f;
+    arena.Reset();
+    inst.Update(0.05f, params, arena, out);  // fire: weight 0 -> exiting motion
+    CHECK(inst.state() == B);
+    CHECK_NEAR(inst.RootMotion().x, 10.0f * 0.05f, 1e-2f);
+
+    // As the blend progresses the delta moves toward the slow state's motion.
+    f32 fire_root = inst.RootMotion().x;
+    for (int i = 0; i < 4; ++i) {
+      arena.Reset();
+      inst.Update(0.05f, params, arena, out);
+    }
+    CHECK(inst.RootMotion().x < fire_root);          // eased down from fast
+    CHECK(inst.RootMotion().x >= 2.0f * 0.05f - 1e-2f);  // not below slow motion
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -480,6 +826,9 @@ int main() {
   TestBoneMask();
   TestSyncGroup();
   TestProgramParams();
+  TestRootMotionLoop();
+  TestRangedEvents();
+  TestStateMachine();
   if (failures == 0) {
     std::printf("kinematest: all passed\n");
     return 0;
