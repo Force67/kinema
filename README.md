@@ -20,6 +20,28 @@ adapter.
 - **Transitions are inertialized** - capture the pose offset at the switch
   and decay it C2-smoothly - so a transition evaluates one graph, not two.
 
+## Graph core
+
+Higher-level constructs compile into the same flat program model - new op
+kinds and precomputed structures, never node-object trees walked at runtime:
+
+- **Blend spaces** place clips at parameter coordinates. 1D (speed ->
+  walk/jog/run) brackets and lerps; 2D (direction x speed strafe sets) uses
+  gradient-band interpolation - no triangulation to build, allocation-free,
+  O(clips) per query. A `kBlendSpace` op samples every contributor at a shared
+  normalized phase, so differently-timed clips stay phase-matched.
+- **Layers**: additive blending (`ApplyAdditive` / `kAdditive`) and per-bone
+  masked blending (`BlendPosesMasked` / `kBlendMasked` over SoA `BoneMask`
+  arrays). `MakeAdditiveClip` bakes a clip into an additive (delta) clip at
+  build time - an ordinary blob with the additive flag, no format change.
+- **Sync groups** keep phase-matched clips foot-synced across a blend:
+  per-clip marker tracks (named events, e.g. footfalls), one shared
+  marker-phase advanced on the leader's clock, followers time-scaled to hit
+  their k-th marker together.
+- **Per-frame parameters** (`PoseParams`): programs compile once per
+  archetype; ops carrying a `*_param` index read live times/alphas/coords from
+  a parameter block each frame, so nothing is reallocated to animate.
+
 ## Use
 
 ```cmake
@@ -45,6 +67,25 @@ kinema::PoseOp program[] = {
     {.kind = kinema::PoseOp::Kind::kBlend, .dst = 2, .a = 0, .b = 1, .alpha = 0.3f},
 };
 kinema::PoseView pose = kinema::ExecuteProgram(program, 3, arena);
+
+// Graph core: a blend space compiled into one op, driven by live params.
+kinema::BlendSpace speed(kinema::BlendSpace::Dim::k1D);
+speed.Add(walk.get(), 0.0f).Add(jog.get(), 3.0f).Add(run.get(), 6.0f);
+speed.Finalize();
+kinema::PoseOp locomotion[] = {
+    {.kind = kinema::PoseOp::Kind::kBlendSpace, .dst = 0, .a = 1,
+     .space = &speed, .time_param = 0, .coord_param = 1},  // a = scratch reg
+};
+float params[2] = {phase01, speed_mps};       // written per frame, no realloc
+kinema::PoseParams pp{params, 2};
+pose = kinema::ExecuteProgram(locomotion, 1, arena, &pp);
+
+// Sync two locomotion clips on their footfall markers; feed LocalTime back in.
+kinema::SyncGroup sync;
+sync.AddClip(*walk.get());  // markers = the clip's events
+sync.AddClip(*run.get());
+sync.Advance(dt, /*leader=*/0);
+params[0] = sync.LocalTime(0);  // per-clip, foot-aligned sample times
 ```
 
 Jolt integration (`kinema/jolt_adapter.h`, header-only, include where Jolt
