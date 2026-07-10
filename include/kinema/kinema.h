@@ -112,6 +112,18 @@ struct Skeleton {
 void ComputeModelSpace(const Skeleton& skeleton, ConstPoseView local, Vec3* out_translation,
                        Quat* out_rotation, f32* out_scale);
 
+// Local-space -> model-space in one forward sweep. REQUIRES parents to precede
+// children in the array (the standard skeleton layout); asserts it in debug.
+// `model` is a separate bones-sized view (may not alias `local`). This is the
+// same accumulation as ComputeModelSpace, exposed over a PoseView because the
+// pose-tooling kernels below (IK, look-at, mirror, foot placement) all operate
+// in model space and engines want the primitive directly.
+void LocalToModel(const Skeleton& skeleton, ConstPoseView local, PoseView model);
+
+// Model-space -> local-space. Each bone reads only its parent's model transform,
+// so no ordering requirement applies; `local` may not alias `model`.
+void ModelToLocal(const Skeleton& skeleton, ConstPoseView model, PoseView local);
+
 // ---------------------------------------------------------------------------
 // Compressed clips.
 
@@ -610,6 +622,158 @@ class StateMachineInstance {
   std::vector<f32> from_s_;
   std::vector<PoseOp> scratch_ops_;
 };
+
+// ---------------------------------------------------------------------------
+// Pose tooling: constraints that run over a model-space pose and write the
+// result back to local. All are allocation-free flat kernels; the caller
+// supplies the model-space pose (from LocalToModel) so the same buffer serves
+// several solves in a chain.
+
+// Two-bone IK (arm / leg). The chain is root_joint -> mid_joint -> end_joint,
+// each the parent of the next. The end joint is driven onto `target`; the mid
+// joint bends toward `pole`. `soft` keeps a slack fraction of the total reach at
+// full extension (0 = hard clamp, straight limb). `weight` blends the solved
+// local rotations of the two rotating joints (root, mid) over the FK pose.
+struct TwoBoneIKSolve {
+  u32 root_joint = 0;
+  u32 mid_joint = 0;
+  u32 end_joint = 0;
+  Vec3 target;
+  Vec3 pole;
+  f32 soft = 0.0f;
+  f32 weight = 1.0f;
+};
+void SolveTwoBoneIK(const Skeleton& skeleton, ConstPoseView model, PoseView local,
+                    const TwoBoneIKSolve& solve);
+
+// Single-joint look-at / aim: rotate `joint` so its local `forward` axis points
+// at `target` (model space), clamped to a cone of half-angle `max_angle`
+// radians, blended by `weight`.
+struct LookAtSolve {
+  u32 joint = 0;
+  Vec3 target;
+  Vec3 forward = Vec3{0.0f, 0.0f, 1.0f};
+  f32 max_angle = 3.14159265f;
+  f32 weight = 1.0f;
+};
+void SolveLookAt(const Skeleton& skeleton, ConstPoseView model, PoseView local,
+                 const LookAtSolve& solve);
+
+// N-joint distributed look-at (e.g. spine + neck + head). `joints` is ordered
+// base..tip; the tip's `forward` axis is aimed at `target` and the required
+// rotation is spread across the chain by `fractions` (sum ~1). Because every
+// joint rotates about the same world aim axis, the tip lands on the full aim
+// when the fractions sum to one.
+struct LookAtChainSolve {
+  const u32* joints = nullptr;
+  const f32* fractions = nullptr;
+  u32 count = 0;
+  Vec3 target;
+  Vec3 forward = Vec3{0.0f, 0.0f, 1.0f};
+  f32 max_angle = 3.14159265f;
+  f32 weight = 1.0f;
+};
+void SolveLookAtChain(const Skeleton& skeleton, ConstPoseView model, PoseView local,
+                      const LookAtChainSolve& solve);
+
+// Foot placement. kinema does no raycasts (zero deps); the caller runs the
+// physics queries and feeds the hit point + normal per foot. The helper
+// computes each foot's IK target (ankle lifted `ankle_height` above the contact
+// along `up`), drops the pelvis by the lowest-foot rule so no leg overextends,
+// then runs the two-bone solves. Flow: engine raycasts down under each ankle ->
+// fills FootHit -> calls this -> reads back the local pose and pelvis offset.
+struct FootLimb {
+  u32 hip = 0, knee = 0, ankle = 0;  // two-bone chain, hip parent of knee etc.
+};
+struct FootHit {
+  Vec3 point;                        // contact position, model space
+  Vec3 normal = Vec3{0.0f, 1.0f, 0.0f};
+  bool valid = false;                // false: foot left at its FK position
+};
+struct FootPlacementSolve {
+  u32 pelvis = 0;
+  const FootLimb* feet = nullptr;
+  const FootHit* hits = nullptr;
+  u32 foot_count = 0;
+  Vec3 up = Vec3{0.0f, 1.0f, 0.0f};
+  f32 ankle_height = 0.0f;
+  f32 max_drop = 1e30f;  // clamp on how far the pelvis may sink (world units)
+  f32 soft = 0.0f;
+  f32 weight = 1.0f;
+};
+// Applies the placement to `local`; `model_scratch` is a bones-sized register
+// the helper fills via LocalToModel. Returns the signed pelvis offset applied
+// along `up` (<= 0: the body sank to the lowest foot).
+f32 SolveFootPlacement(const Skeleton& skeleton, PoseView local, PoseView model_scratch,
+                       const FootPlacementSolve& solve);
+
+// ---------------------------------------------------------------------------
+// Pose mirroring. A MirrorTable pairs bone i with bone j (built once) and
+// records a per-bone flip axis. MirrorPose(src -> dst) reflects the local pose
+// across the sagittal plane: it swaps paired bones and negates the transform
+// about the flip axis. Default axis is X (the sagittal plane's normal for the
+// usual character rig): local translation.x negates and a quaternion
+// (x,y,z,w) -> (x,-y,-z,w). That component rule is the exact reflection of a
+// rotation across the X=0 plane (reflect axis, negate angle), so a symmetric
+// rig round-trips (mirror twice == identity). It assumes left/right bone local
+// frames are mirror images, the standard authored convention.
+class MirrorTable {
+ public:
+  enum class Axis : u8 { kX = 0, kY = 1, kZ = 2 };
+  MirrorTable() = default;
+  void Init(u32 bones, Axis default_axis = Axis::kX);
+  void Pair(u32 a, u32 b, Axis axis = Axis::kX);  // maps a<->b (and b<->a)
+  void SetSelf(u32 bone, Axis axis = Axis::kX);    // centerline bone onto itself
+  u32 size() const { return static_cast<u32>(partner_.size()); }
+  u32 Partner(u32 bone) const { return partner_[bone]; }
+  Axis axis(u32 bone) const { return axis_[bone]; }
+
+ private:
+  std::vector<u32> partner_;
+  std::vector<Axis> axis_;
+};
+
+void MirrorPose(const MirrorTable& table, ConstPoseView src, PoseView dst);
+
+// Auto-build a MirrorTable from names, with no engine naming baked in: `name`
+// returns bone b's name; two bones are paired when their names are equal after
+// swapping the first occurrence of left_token<->right_token (e.g. "L_"/"R_" or
+// " L "/" R "). Bones with no partner mirror onto themselves.
+void BuildMirrorTable(MirrorTable& out, u32 bones,
+                      std::string_view (*name)(void* user, u32 bone), void* user,
+                      std::string_view left_token, std::string_view right_token,
+                      MirrorTable::Axis axis = MirrorTable::Axis::kX);
+
+// ---------------------------------------------------------------------------
+// Basic retargeting. Built from a source and target skeleton, a bone mapping and
+// both bind (reference) poses (taken from each Skeleton's bind_* fields). At
+// runtime RetargetPose transfers a source LOCAL pose onto the target: each
+// mapped bone's rotation is carried through the bind-orientation difference
+// (tgt_bind * src_bind^-1 * src_local) and its translation is scaled by the
+// per-bone reference-length ratio (target bind offset length / source's), so a
+// proportionally larger/smaller rig gets proportionally scaled translations.
+// Limits: this is rotation-copy + proportion scaling, NOT IK retargeting - it
+// does not preserve end-effector world positions across differing proportions.
+// Unmapped target bones are left untouched (pre-fill them with the target bind
+// pose). The transfer is a flat kernel over the mapping array.
+class RetargetTable {
+ public:
+  struct Map {
+    u32 src = 0, tgt = 0;
+    Vec3 src_bind_t, tgt_bind_t;
+    f32 ratio = 1.0f;
+    Quat rot_fix;  // tgt_bind_r * conj(src_bind_r)
+  };
+  void Build(const Skeleton& src, const Skeleton& tgt, const u32* src_bone, const u32* tgt_bone,
+             u32 count);
+  u32 count() const { return static_cast<u32>(maps_.size()); }
+  const Map* maps() const { return maps_.data(); }
+
+ private:
+  std::vector<Map> maps_;
+};
+
+void RetargetPose(const RetargetTable& table, ConstPoseView src_local, PoseView tgt_local);
 
 }  // namespace kinema
 

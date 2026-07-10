@@ -12,6 +12,7 @@ add_library(kinema STATIC
   src/blend.cc
   src/graph.cc
   src/state.cc
+  src/pose_tools.cc
 )
 add_library(kinema::kinema ALIAS kinema)
 target_include_directories(kinema PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)

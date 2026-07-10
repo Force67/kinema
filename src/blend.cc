@@ -82,27 +82,8 @@ int Skeleton::Find(u64 name_hash) const {
 
 void ComputeModelSpace(const Skeleton& skeleton, ConstPoseView local, Vec3* out_t, Quat* out_r,
                        f32* out_s) {
-  const u32 n = skeleton.count();
-  assert(local.count == n);
-  for (u32 i = 0; i < n; ++i) {
-    int p = skeleton.parents[i];
-    if (p < 0) {
-      out_t[i] = local.translation[i];
-      out_r[i] = local.rotation[i];
-      out_s[i] = local.scale[i];
-      continue;
-    }
-    const Quat& pr = out_r[p];
-    Vec3 v{local.translation[i].x * out_s[p], local.translation[i].y * out_s[p],
-           local.translation[i].z * out_s[p]};
-    // v' = pr * v * pr^-1
-    Quat t = Mul(pr, Quat{v.x, v.y, v.z, 0});
-    Quat rotated = Mul(t, Conjugate(pr));
-    out_t[i] = Vec3{out_t[p].x + rotated.x, out_t[p].y + rotated.y, out_t[p].z + rotated.z};
-    Quat r = Mul(pr, local.rotation[i]);
-    out_r[i] = Normalize(r.x, r.y, r.z, r.w);
-    out_s[i] = out_s[p] * local.scale[i];
-  }
+  // Same accumulation as LocalToModel, over raw output arrays.
+  LocalToModel(skeleton, local, PoseView{out_t, out_r, out_s, skeleton.count()});
 }
 
 // ---------------------------------------------------------------------------
