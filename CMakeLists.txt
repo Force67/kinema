@@ -18,6 +18,7 @@ set_target_properties(kinema PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 option(KINEMA_BUILD_TESTS "Build the kinema unit tests" OFF)
 if(KINEMA_BUILD_TESTS)
+  enable_testing()  # without this add_test is a no-op and ctest finds nothing
   add_executable(kinematest test/kinema_test.cc)
   target_link_libraries(kinematest PRIVATE kinema)
   add_test(NAME kinematest COMMAND kinematest)
