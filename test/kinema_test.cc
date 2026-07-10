@@ -3,8 +3,11 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
+#include <string_view>
 #include <tuple>
 #include <vector>
 
@@ -189,9 +192,9 @@ void TestProgram() {
   OwnedClip ca(ba.Build()), cb(bb.Build());
   PoseArena arena(kTracks, 3);
   PoseOp ops[3];
-  ops[0] = {.kind = PoseOp::Kind::kSample, .dst = 0, .clip = ca.get(), .time = 0};
-  ops[1] = {.kind = PoseOp::Kind::kSample, .dst = 1, .clip = cb.get(), .time = 0};
-  ops[2] = {.kind = PoseOp::Kind::kBlend, .dst = 2, .a = 0, .b = 1, .alpha = 0.25f};
+  ops[0].kind = PoseOp::Kind::kSample; ops[0].dst = 0; ops[0].clip = ca.get(); ops[0].time = 0;
+  ops[1].kind = PoseOp::Kind::kSample; ops[1].dst = 1; ops[1].clip = cb.get(); ops[1].time = 0;
+  ops[2].kind = PoseOp::Kind::kBlend; ops[2].dst = 2; ops[2].a = 0; ops[2].b = 1; ops[2].alpha = 0.25f;
   PoseView out = ExecuteProgram(ops, 3, arena);
   CHECK_NEAR(out.translation[0].x, 2.5f, 1e-5f);
 }
@@ -431,9 +434,9 @@ void TestProgramParams() {
 
   PoseArena arena(1, 3);
   PoseOp ops[3];
-  ops[0] = {.kind = PoseOp::Kind::kSample, .dst = 0, .clip = c0.get(), .time_param = 0};
-  ops[1] = {.kind = PoseOp::Kind::kSample, .dst = 1, .clip = c1.get(), .time_param = 0};
-  ops[2] = {.kind = PoseOp::Kind::kBlend, .dst = 2, .a = 0, .b = 1, .alpha_param = 1};
+  ops[0].kind = PoseOp::Kind::kSample; ops[0].dst = 0; ops[0].clip = c0.get(); ops[0].time_param = 0;
+  ops[1].kind = PoseOp::Kind::kSample; ops[1].dst = 1; ops[1].clip = c1.get(); ops[1].time_param = 0;
+  ops[2].kind = PoseOp::Kind::kBlend; ops[2].dst = 2; ops[2].a = 0; ops[2].b = 1; ops[2].alpha_param = 1;
 
   f32 buf[2];
   PoseParams params{buf, 2};
@@ -450,12 +453,12 @@ void TestProgramParams() {
 
   // Blend-space op driven by a coord param, using register 1 as scratch.
   PoseOp bsops[1];
-  bsops[0] = {.kind = PoseOp::Kind::kBlendSpace,
-              .dst = 0,
-              .a = 1,
-              .space = &bs,
-              .time_param = 2,
-              .coord_param = 3};
+  bsops[0].kind = PoseOp::Kind::kBlendSpace;
+  bsops[0].dst = 0;
+  bsops[0].a = 1;
+  bsops[0].space = &bs;
+  bsops[0].time_param = 2;
+  bsops[0].coord_param = 3;
   f32 bbuf[4] = {0, 0, 0.0f /*phase*/, 0.5f /*coord*/};
   PoseParams bparams{bbuf, 4};
   arena.Reset();
@@ -812,6 +815,540 @@ void TestStateMachine() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Wave 3: pose tooling.
+
+std::uint64_t Fnv64(const std::vector<u8>& bytes) {
+  std::uint64_t h = 14695981039346656037ull;
+  for (u8 b : bytes) {
+    h ^= b;
+    h *= 1099511628211ull;
+  }
+  return h;
+}
+
+// A branched skeleton: 0=root, 1=spine(0), 2=armL(1), 3=armR(1), 4=head(1),
+// 5=handL(2). Parents strictly precede children.
+Skeleton MakeBranchedSkeleton() {
+  Skeleton s;
+  s.parents = {-1, 0, 1, 1, 1, 2};
+  const char* names[] = {"root", "spine", "armL", "armR", "head", "handL"};
+  for (const char* n : names) s.name_hashes.push_back(HashName(n));
+  s.bind_translation.assign(6, Vec3{});
+  s.bind_rotation.assign(6, Quat{});
+  s.bind_scale.assign(6, 1.0f);
+  return s;
+}
+
+void TestLocalModelRoundTrip() {
+  Skeleton s = MakeBranchedSkeleton();
+  const u32 n = s.count();
+  std::vector<Vec3> lt(n);
+  std::vector<Quat> lr(n);
+  std::vector<f32> ls(n);
+  PoseView local{lt.data(), lr.data(), ls.data(), n};
+  for (u32 i = 0; i < n; ++i) {
+    local.translation[i] = Vec3{0.5f + 0.3f * i, 1.0f - 0.1f * i, 0.2f * i};
+    local.rotation[i] = AxisAngle(0.2f * i + 0.1f, 1.0f, 0.3f, 0.4f + 0.2f * i);
+    local.scale[i] = 1.0f + 0.05f * i;
+  }
+  std::vector<Vec3> mt(n);
+  std::vector<Quat> mr(n);
+  std::vector<f32> ms(n);
+  PoseView model{mt.data(), mr.data(), ms.data(), n};
+  LocalToModel(s, local, model);
+  std::vector<Vec3> bt(n);
+  std::vector<Quat> br(n);
+  std::vector<f32> bs(n);
+  PoseView back{bt.data(), br.data(), bs.data(), n};
+  ModelToLocal(s, model, back);
+  for (u32 i = 0; i < n; ++i) {
+    CHECK_NEAR(back.translation[i].x, local.translation[i].x, 1e-4f);
+    CHECK_NEAR(back.translation[i].y, local.translation[i].y, 1e-4f);
+    CHECK_NEAR(back.translation[i].z, local.translation[i].z, 1e-4f);
+    CHECK_NEAR(QuatError(back.rotation[i], local.rotation[i]), 0.0f, 1e-5f);
+    CHECK_NEAR(back.scale[i], local.scale[i], 1e-4f);
+  }
+  // ComputeModelSpace (raw-array form) must agree with LocalToModel.
+  std::vector<Vec3> ct(n);
+  std::vector<Quat> cr(n);
+  std::vector<f32> cs(n);
+  ComputeModelSpace(s, local, ct.data(), cr.data(), cs.data());
+  for (u32 i = 0; i < n; ++i) {
+    CHECK_NEAR(ct[i].x, model.translation[i].x, 1e-5f);
+    CHECK_NEAR(QuatError(cr[i], model.rotation[i]), 0.0f, 1e-6f);
+  }
+}
+
+// A simple 4-bone arm chain: 0=root, 1=shoulder, 2=elbow, 3=wrist, straight
+// along +x with unit segment lengths.
+Skeleton MakeArm() {
+  Skeleton s;
+  s.parents = {-1, 0, 1, 2};
+  s.name_hashes = {HashName("root"), HashName("shoulder"), HashName("elbow"), HashName("wrist")};
+  s.bind_translation.assign(4, Vec3{});
+  s.bind_rotation.assign(4, Quat{});
+  s.bind_scale.assign(4, 1.0f);
+  return s;
+}
+
+void SetArmPose(PoseView local) {
+  local.translation[0] = Vec3{0, 0, 0};
+  local.translation[1] = Vec3{0, 0, 0};  // shoulder at root
+  local.translation[2] = Vec3{1, 0, 0};  // upper arm length 1
+  local.translation[3] = Vec3{1, 0, 0};  // forearm length 1
+  for (u32 i = 0; i < 4; ++i) {
+    local.rotation[i] = Quat{};
+    local.scale[i] = 1.0f;
+  }
+}
+
+void TestTwoBoneIK() {
+  Skeleton s = MakeArm();
+  PoseArena arena(4, 2);
+  auto solve_and_model = [&](Vec3 target, Vec3 pole, f32 soft, f32 weight, PoseView out_model) {
+    PoseView local = arena.At(0);
+    SetArmPose(local);
+    PoseView model = arena.At(1);
+    LocalToModel(s, local, model);
+    TwoBoneIKSolve ik;
+    ik.root_joint = 1;
+    ik.mid_joint = 2;
+    ik.end_joint = 3;
+    ik.target = target;
+    ik.pole = pole;
+    ik.soft = soft;
+    ik.weight = weight;
+    SolveTwoBoneIK(s, model, local, ik);
+    LocalToModel(s, local, out_model);
+  };
+  std::vector<Vec3> mt(4);
+  std::vector<Quat> mr(4);
+  std::vector<f32> ms(4);
+  PoseView out{mt.data(), mr.data(), ms.data(), 4};
+
+  // Reachable target: wrist lands on it, elbow bends toward the pole (+z).
+  solve_and_model(Vec3{1, 1, 0}, Vec3{0.5f, 0.5f, 2.0f}, 0.0f, 1.0f, out);
+  CHECK_NEAR(out.translation[3].x, 1.0f, 2e-3f);
+  CHECK_NEAR(out.translation[3].y, 1.0f, 2e-3f);
+  CHECK_NEAR(out.translation[3].z, 0.0f, 2e-3f);
+  CHECK(out.translation[2].z > 0.05f);  // elbow pushed toward +z pole
+
+  // Pole on the other side flips the elbow.
+  solve_and_model(Vec3{1, 1, 0}, Vec3{0.5f, 0.5f, -2.0f}, 0.0f, 1.0f, out);
+  CHECK(out.translation[2].z < -0.05f);
+
+  // Out-of-reach target clamps at full extension along the target direction.
+  solve_and_model(Vec3{5, 0, 0}, Vec3{0, 0, 1}, 0.0f, 1.0f, out);
+  f32 reach = std::sqrt(out.translation[3].x * out.translation[3].x +
+                        out.translation[3].y * out.translation[3].y +
+                        out.translation[3].z * out.translation[3].z);
+  CHECK_NEAR(reach, 2.0f, 5e-3f);  // both segments straight
+  CHECK_NEAR(out.translation[3].x, 2.0f, 5e-3f);
+
+  // weight = 0 leaves the FK pose; weight = 0.5 moves partway to the target.
+  solve_and_model(Vec3{1, 1, 0}, Vec3{0, 0, 1}, 0.0f, 0.0f, out);
+  f32 err0 = std::abs(out.translation[3].x - 1.0f) + std::abs(out.translation[3].y - 1.0f);
+  CHECK(err0 > 0.9f);  // still near the straight FK pose (2,0,0)
+  solve_and_model(Vec3{1, 1, 0}, Vec3{0, 0, 1}, 0.0f, 0.5f, out);
+  f32 err5 = std::abs(out.translation[3].x - 1.0f) + std::abs(out.translation[3].y - 1.0f);
+  CHECK(err5 < err0);  // moved toward the target
+}
+
+// Serial aim chain: 0=root, 1,2,3 stacked along +y, each parent of the next.
+Skeleton MakeSpine() {
+  Skeleton s;
+  s.parents = {-1, 0, 1, 2};
+  s.name_hashes = {HashName("root"), HashName("s0"), HashName("s1"), HashName("head")};
+  s.bind_translation.assign(4, Vec3{});
+  s.bind_rotation.assign(4, Quat{});
+  s.bind_scale.assign(4, 1.0f);
+  return s;
+}
+
+void TestLookAt() {
+  // Single joint: aim local +z at a target, then clamp to a cone.
+  Skeleton s;
+  s.parents = {-1};
+  s.name_hashes = {HashName("aim")};
+  auto forward_of = [](const Quat& q) {
+    return Vec3{2 * (q.x * q.z + q.w * q.y), 2 * (q.y * q.z - q.w * q.x),
+                1 - 2 * (q.x * q.x + q.y * q.y)};  // rotate {0,0,1}
+  };
+  {
+    std::vector<Vec3> lt(1), mt(1);
+    std::vector<Quat> lr(1), mr(1);
+    std::vector<f32> lsc(1), msc(1);
+    PoseView local{lt.data(), lr.data(), lsc.data(), 1};
+    local.translation[0] = Vec3{0, 0, 0};
+    local.rotation[0] = Quat{};
+    local.scale[0] = 1.0f;
+    PoseView model{mt.data(), mr.data(), msc.data(), 1};
+    LocalToModel(s, local, model);
+    LookAtSolve la;
+    la.joint = 0;
+    la.target = Vec3{1, 0, 0};
+    la.forward = Vec3{0, 0, 1};
+    la.weight = 1.0f;
+    SolveLookAt(s, model, local, la);
+    LocalToModel(s, local, model);
+    Vec3 fwd = forward_of(model.rotation[0]);
+    CHECK_NEAR(fwd.x, 1.0f, 1e-3f);  // now points +x
+    CHECK_NEAR(fwd.z, 0.0f, 1e-3f);
+  }
+  {
+    std::vector<Vec3> lt(1), mt(1);
+    std::vector<Quat> lr(1), mr(1);
+    std::vector<f32> lsc(1), msc(1);
+    PoseView local{lt.data(), lr.data(), lsc.data(), 1};
+    local.translation[0] = Vec3{0, 0, 0};
+    local.rotation[0] = Quat{};
+    local.scale[0] = 1.0f;
+    PoseView model{mt.data(), mr.data(), msc.data(), 1};
+    LocalToModel(s, local, model);
+    LookAtSolve la;
+    la.joint = 0;
+    la.target = Vec3{1, 0, 0};  // wants 90 deg
+    la.forward = Vec3{0, 0, 1};
+    la.max_angle = 0.2f;  // but clamp to 0.2 rad
+    la.weight = 1.0f;
+    SolveLookAt(s, model, local, la);
+    // Angle of the applied rotation about its axis is the clamp value.
+    Quat q = local.rotation[0];
+    f32 angle = 2.0f * std::acos(std::min(1.0f, std::abs(q.w)));
+    CHECK_NEAR(angle, 0.2f, 1e-3f);
+  }
+
+  // N-joint chain: fractions summing to 1 rotate each joint by its share and
+  // land the tip on the full aim.
+  Skeleton sp = MakeSpine();
+  const u32 n = 4;
+  std::vector<Vec3> lt(n), mt(n);
+  std::vector<Quat> lr(n), mr(n);
+  std::vector<f32> lsc(n), msc(n);
+  PoseView local{lt.data(), lr.data(), lsc.data(), n};
+  local.translation[0] = Vec3{0, 0, 0};
+  local.translation[1] = Vec3{0, 0, 0};
+  local.translation[2] = Vec3{0, 1, 0};
+  local.translation[3] = Vec3{0, 1, 0};
+  for (u32 i = 0; i < n; ++i) {
+    local.rotation[i] = Quat{};
+    local.scale[i] = 1.0f;
+  }
+  PoseView model{mt.data(), mr.data(), msc.data(), n};
+  LocalToModel(sp, local, model);
+  Vec3 tip_pos = model.translation[3];
+  Vec3 dir{10.0f - tip_pos.x, 2.0f - tip_pos.y, 0.0f - tip_pos.z};
+  f32 dl = std::sqrt(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z);
+  dir = Vec3{dir.x / dl, dir.y / dl, dir.z / dl};
+
+  u32 joints[3] = {1, 2, 3};
+  f32 fracs[3] = {0.5f, 0.3f, 0.2f};
+  LookAtChainSolve lc;
+  lc.joints = joints;
+  lc.fractions = fracs;
+  lc.count = 3;
+  lc.target = Vec3{10, 2, 0};
+  lc.forward = Vec3{0, 0, 1};
+  lc.weight = 1.0f;
+  SolveLookAtChain(sp, model, local, lc);
+  // Each joint rotated by frac * total_angle (total = 90 deg here).
+  f32 total = 1.57079633f;  // +z to +x
+  for (u32 i = 0; i < 3; ++i) {
+    Quat q = local.rotation[joints[i]];
+    f32 angle = 2.0f * std::acos(std::min(1.0f, std::abs(q.w)));
+    CHECK_NEAR(angle, fracs[i] * total, 5e-3f);
+  }
+  // Tip forward now points along the original aim direction.
+  LocalToModel(sp, local, model);
+  Quat q = model.rotation[3];
+  Vec3 fwd{2 * (q.x * q.z + q.w * q.y), 2 * (q.y * q.z - q.w * q.x),
+           1 - 2 * (q.x * q.x + q.y * q.y)};
+  CHECK_NEAR(fwd.x, dir.x, 5e-3f);
+  CHECK_NEAR(fwd.y, dir.y, 5e-3f);
+  CHECK_NEAR(fwd.z, dir.z, 5e-3f);
+}
+
+void TestFootPlacement() {
+  // Pelvis (root) with two legs: hipL/kneeL/ankleL and hipR/kneeR/ankleR.
+  Skeleton s;
+  s.parents = {-1, 0, 1, 2, 0, 4, 5};
+  //           pel hipL kneeL ankL hipR kneeR ankR
+  const char* names[] = {"pelvis", "hipL", "kneeL", "ankleL", "hipR", "kneeR", "ankleR"};
+  for (const char* nm : names) s.name_hashes.push_back(HashName(nm));
+  s.bind_translation.assign(7, Vec3{});
+  s.bind_rotation.assign(7, Quat{});
+  s.bind_scale.assign(7, 1.0f);
+  const u32 n = 7;
+  std::vector<Vec3> lt(n), mt(n);
+  std::vector<Quat> lr(n);
+  std::vector<f32> ls(n), ms(n);
+  std::vector<Quat> mr(n);
+  PoseView local{lt.data(), lr.data(), ls.data(), n};
+  // Pelvis at height 2; legs hang straight down (-y), each segment length 1.
+  local.translation[0] = Vec3{0, 2, 0};       // pelvis
+  local.translation[1] = Vec3{-0.5f, 0, 0};   // hipL offset
+  local.translation[2] = Vec3{0, -1, 0};      // kneeL
+  local.translation[3] = Vec3{0, -1, 0};      // ankleL
+  local.translation[4] = Vec3{0.5f, 0, 0};    // hipR offset
+  local.translation[5] = Vec3{0, -1, 0};      // kneeR
+  local.translation[6] = Vec3{0, -1, 0};      // ankleR
+  for (u32 i = 0; i < n; ++i) {
+    local.rotation[i] = Quat{};
+    local.scale[i] = 1.0f;
+  }
+  PoseView model{mt.data(), mr.data(), ms.data(), n};
+
+  FootLimb feet[2];
+  feet[0].hip = 1;
+  feet[0].knee = 2;
+  feet[0].ankle = 3;
+  feet[1].hip = 4;
+  feet[1].knee = 5;
+  feet[1].ankle = 6;
+  // Ankles currently at y=0. Left ground at y=-0.3, right ground at y=-0.1.
+  FootHit hits[2];
+  hits[0].point = Vec3{-0.5f, -0.3f, 0};
+  hits[0].normal = Vec3{0, 1, 0};
+  hits[0].valid = true;
+  hits[1].point = Vec3{0.5f, -0.1f, 0};
+  hits[1].normal = Vec3{0, 1, 0};
+  hits[1].valid = true;
+
+  FootPlacementSolve fp;
+  fp.pelvis = 0;
+  fp.feet = feet;
+  fp.hits = hits;
+  fp.foot_count = 2;
+  fp.up = Vec3{0, 1, 0};
+  fp.ankle_height = 0.0f;
+  fp.weight = 1.0f;
+  f32 offset = SolveFootPlacement(s, local, model, fp);
+  // Lowest-foot rule: pelvis drops by the deeper (left) contact, -0.3.
+  CHECK_NEAR(offset, -0.3f, 1e-4f);
+  // Both ankles end up on their ground contacts.
+  LocalToModel(s, local, model);
+  CHECK_NEAR(model.translation[3].y, -0.3f, 5e-3f);
+  CHECK_NEAR(model.translation[6].y, -0.1f, 5e-3f);
+}
+
+// Name lookup for BuildMirrorTable.
+struct NameList {
+  const char** names;
+};
+std::string_view NameOf(void* user, u32 bone) {
+  return static_cast<NameList*>(user)->names[bone];
+}
+
+void TestMirror() {
+  // 0=root(center), 1=L, 2=R, plus 3=center2.
+  MirrorTable table;
+  table.Init(4, MirrorTable::Axis::kX);
+  table.Pair(1, 2, MirrorTable::Axis::kX);
+  // 0 and 3 stay self-paired (centerline).
+
+  std::vector<Vec3> st(4), dt(4), d2t(4);
+  std::vector<Quat> sr(4), dr(4), d2r(4);
+  std::vector<f32> ss(4), ds(4), d2s(4);
+  PoseView src{st.data(), sr.data(), ss.data(), 4};
+  for (u32 i = 0; i < 4; ++i) {
+    src.translation[i] = Vec3{1.0f + i, 2.0f - i, 0.5f * i};
+    src.rotation[i] = AxisAngle(0.2f, 0.3f, 1.0f, 0.4f + 0.1f * i);
+    src.scale[i] = 1.0f + 0.1f * i;
+  }
+  PoseView dst{dt.data(), dr.data(), ds.data(), 4};
+  MirrorPose(table, src, dst);
+  // Asymmetric pose lands on the mirrored bone: dst[1] == flip(src[2]).
+  CHECK_NEAR(dst.translation[1].x, -src.translation[2].x, 1e-5f);
+  CHECK_NEAR(dst.translation[1].y, src.translation[2].y, 1e-5f);
+  CHECK_NEAR(dst.rotation[1].x, src.rotation[2].x, 1e-5f);
+  CHECK_NEAR(dst.rotation[1].y, -src.rotation[2].y, 1e-5f);
+
+  // Mirror twice == identity.
+  PoseView d2{d2t.data(), d2r.data(), d2s.data(), 4};
+  MirrorPose(table, dst, d2);
+  for (u32 i = 0; i < 4; ++i) {
+    CHECK_NEAR(d2.translation[i].x, src.translation[i].x, 1e-5f);
+    CHECK_NEAR(d2.translation[i].y, src.translation[i].y, 1e-5f);
+    CHECK_NEAR(d2.translation[i].z, src.translation[i].z, 1e-5f);
+    CHECK_NEAR(QuatError(d2.rotation[i], src.rotation[i]), 0.0f, 1e-6f);
+    CHECK_NEAR(d2.scale[i], src.scale[i], 1e-6f);
+  }
+
+  // Auto-build from names, no engine naming baked in.
+  const char* names[4] = {"Root", "L_Arm", "R_Arm", "Spine"};
+  NameList nl{names};
+  MirrorTable built;
+  BuildMirrorTable(built, 4, &NameOf, &nl, "L_", "R_", MirrorTable::Axis::kX);
+  CHECK(built.Partner(1) == 2);
+  CHECK(built.Partner(2) == 1);
+  CHECK(built.Partner(0) == 0);  // centerline
+  CHECK(built.Partner(3) == 3);
+}
+
+void TestRetarget() {
+  Skeleton src;
+  src.parents = {-1, 0, 1};
+  src.name_hashes = {HashName("a"), HashName("b"), HashName("c")};
+  src.bind_translation = {Vec3{0, 0, 0}, Vec3{1, 0, 0}, Vec3{1, 0, 0}};
+  src.bind_rotation.assign(3, Quat{});
+  src.bind_scale.assign(3, 1.0f);
+
+  u32 map_s[3] = {0, 1, 2};
+  u32 map_t[3] = {0, 1, 2};
+
+  // Identity: same skeleton -> pose passes through unchanged.
+  {
+    RetargetTable rt;
+    rt.Build(src, src, map_s, map_t, 3);
+    std::vector<Vec3> st(3), tt(3);
+    std::vector<Quat> sr(3), tr(3);
+    std::vector<f32> ssc(3), tsc(3);
+    PoseView sp{st.data(), sr.data(), ssc.data(), 3};
+    for (u32 i = 0; i < 3; ++i) {
+      sp.translation[i] = Vec3{static_cast<f32>(i), 0.5f, -0.3f};
+      sp.rotation[i] = AxisAngle(0, 0, 1, 0.3f + 0.1f * i);
+      sp.scale[i] = 1.0f;
+    }
+    PoseView tp{tt.data(), tr.data(), tsc.data(), 3};
+    RetargetPose(rt, sp, tp);
+    for (u32 i = 0; i < 3; ++i) {
+      CHECK_NEAR(tp.translation[i].x, sp.translation[i].x, 1e-5f);
+      CHECK_NEAR(QuatError(tp.rotation[i], sp.rotation[i]), 0.0f, 1e-6f);
+    }
+  }
+
+  // Scaled target skeleton (2x bone offsets) -> translations scale by the
+  // per-bone reference-length ratio, rotations pass through.
+  {
+    Skeleton tgt = src;
+    for (u32 i = 0; i < 3; ++i) tgt.bind_translation[i] = Vec3{src.bind_translation[i].x * 2.0f,
+                                                               src.bind_translation[i].y * 2.0f,
+                                                               src.bind_translation[i].z * 2.0f};
+    RetargetTable rt;
+    rt.Build(src, tgt, map_s, map_t, 3);
+    std::vector<Vec3> st(3), tt(3);
+    std::vector<Quat> sr(3), tr(3);
+    std::vector<f32> ssc(3), tsc(3);
+    PoseView sp{st.data(), sr.data(), ssc.data(), 3};
+    for (u32 i = 0; i < 3; ++i) {
+      sp.translation[i] = src.bind_translation[i];  // at bind
+      sp.rotation[i] = AxisAngle(0, 1, 0, 0.5f);
+      sp.scale[i] = 1.0f;
+    }
+    PoseView tp{tt.data(), tr.data(), tsc.data(), 3};
+    RetargetPose(rt, sp, tp);
+    // Bone 1 offset was (1,0,0); target proportion 2x -> (2,0,0).
+    CHECK_NEAR(tp.translation[1].x, 2.0f, 1e-4f);
+    CHECK_NEAR(QuatError(tp.rotation[1], sp.rotation[1]), 0.0f, 1e-6f);
+  }
+}
+
+void TestCurves() {
+  constexpr u32 kFrames = 31;
+  constexpr f32 kRate = 30.0f;
+  auto jaw = [](f32 t) { return 0.5f + 0.4f * std::sin(t * 3.0f); };
+  auto blink = [](f32 t) { return 0.2f * t; };
+  ClipBuilder b(2, kFrames, kRate);
+  u16 c_jaw = b.AddCurve("Jaw");
+  u16 c_blink = b.AddCurve("Blink");
+  for (u32 f = 0; f < kFrames; ++f) {
+    f32 t = static_cast<f32>(f) / kRate;
+    for (u32 tr = 0; tr < 2; ++tr) b.SetSample(f, tr, Vec3{}, Quat{}, 1.0f);
+    b.SetCurveSample(f, c_jaw, jaw(t));
+    b.SetCurveSample(f, c_blink, blink(t));
+  }
+  OwnedClip clip(b.Build());
+  CHECK(static_cast<bool>(clip));
+  CHECK(clip->num_curves() == 2);
+  CHECK(clip->FindCurve(HashName("Jaw")) >= 0);
+  CHECK(clip->FindCurve(HashName("Blink")) >= 0);
+  CHECK(clip->FindCurve(HashName("Nope")) < 0);
+
+  // Round-trip within quantization (piecewise-linear ground truth).
+  f32 worst = 0;
+  for (int i = 0; i <= 60; ++i) {
+    f32 time = clip->duration() * static_cast<f32>(i) / 60.0f;
+    f32 x = time * kRate;
+    u32 k = std::min(static_cast<u32>(x), kFrames - 2);
+    f32 a = x - static_cast<f32>(k);
+    f32 truth = jaw(static_cast<f32>(k) / kRate) * (1 - a) + jaw(static_cast<f32>(k + 1) / kRate) * a;
+    worst = std::max(worst, std::abs(clip->SampleCurve(HashName("Jaw"), time) - truth));
+  }
+  CHECK(worst < 2e-4f);  // 16-bit over the curve's range
+  CHECK_NEAR(clip->SampleCurve(HashName("Missing"), 0.5f, -1.0f), -1.0f, 0.0f);  // fallback
+
+  // Blob relocatability with the v3 curve block.
+  std::vector<u8> copy(clip.bytes());
+  auto view = Clip::FromBlob(copy.data(), copy.size());
+  CHECK(view.has_value());
+  CHECK(view->num_curves() == 2);
+
+  // v1/v2 clips load with zero curves.
+  OwnedClip plain = MakeClipDur(0.0f, 1.0f);
+  CHECK(plain->num_curves() == 0);
+  ClipBuilder rb(1, 31, 30.0f);
+  for (u32 f = 0; f < 31; ++f) rb.SetSample(f, 0, Vec3{}, Quat{}, 1.0f);
+  rb.AddRangedEvent("Attack", 0.3f, 0.7f);  // v2
+  OwnedClip ranged(rb.Build());
+  CHECK(ranged->num_curves() == 0);
+  CHECK(ranged->num_ranged_events() == 1);
+
+  // Curves and ranged events coexist in one v3 clip.
+  ClipBuilder cb(1, 31, 30.0f);
+  for (u32 f = 0; f < 31; ++f) {
+    cb.SetSample(f, 0, Vec3{}, Quat{}, 1.0f);
+  }
+  u16 w = cb.AddCurve("Weight");
+  for (u32 f = 0; f < 31; ++f) cb.SetCurveSample(f, w, static_cast<f32>(f) / 30.0f);
+  cb.AddRangedEvent("Guard", 0.1f, 0.9f);
+  OwnedClip both(cb.Build());
+  CHECK(both->num_curves() == 1);
+  CHECK(both->num_ranged_events() == 1);
+  CHECK_NEAR(both->SampleCurve(HashName("Weight"), 0.5f), 0.5f, 2e-3f);
+}
+
+// Curve-free golden blobs: their byte layout must never change when the format
+// grows. Regenerate with tools/golden.cc if the layout intentionally changes.
+constexpr std::uint64_t kGoldenV1 = 0x3fdff5e4d9fd7f10ull;
+constexpr std::uint64_t kGoldenV2 = 0x180ba2330006ffc4ull;
+
+std::vector<u8> BuildGolden(bool with_ranged) {
+  ClipBuilder b(6, 41, 30.0f);
+  for (u32 f = 0; f < 41; ++f) {
+    f32 t = static_cast<f32>(f) / 30.0f;
+    for (u32 k = 0; k < 6; ++k) {
+      Vec3 tr;
+      Quat r;
+      f32 s = 1.0f;
+      if (k == 0) {
+        tr = Vec3{1.0f, 2.0f, 3.0f};
+        r = Quat{0.0f, 0.0f, 0.1986693f, 0.9800666f};
+      } else {
+        f32 p = t * (0.5f + 0.3f * static_cast<f32>(k));
+        tr = Vec3{4.0f * (p - static_cast<f32>(static_cast<int>(p))), 2.0f * static_cast<f32>(k),
+                  1.5f};
+        f32 half = 0.5f * (0.3f * p);
+        r = Quat{0.0f, 0.0f, half, 1.0f - 0.5f * half * half};
+        s = 1.0f + 0.1f * (p - static_cast<f32>(static_cast<int>(p)));
+      }
+      b.SetSample(f, k, tr, r, s);
+    }
+  }
+  b.AddEvent("FootLeft", 0.4f);
+  b.AddEvent("FootRight", 1.1f);
+  if (with_ranged) b.AddRangedEvent("Attack", 0.3f, 0.7f);
+  b.AddRootKey(1.0f, Vec3{0.0f, 40.0f, 0.0f});
+  return b.Build();
+}
+
+void TestGoldenByteCompat() {
+  std::vector<u8> v1 = BuildGolden(false);
+  std::vector<u8> v2 = BuildGolden(true);
+  CHECK(Fnv64(v1) == kGoldenV1);  // curve-free v1 layout unchanged
+  CHECK(Fnv64(v2) == kGoldenV2);  // curve-free v2 layout unchanged
+}
+
 }  // namespace
 
 int main() {
@@ -829,6 +1366,14 @@ int main() {
   TestRootMotionLoop();
   TestRangedEvents();
   TestStateMachine();
+  TestLocalModelRoundTrip();
+  TestTwoBoneIK();
+  TestLookAt();
+  TestFootPlacement();
+  TestMirror();
+  TestRetarget();
+  TestCurves();
+  TestGoldenByteCompat();
   if (failures == 0) {
     std::printf("kinematest: all passed\n");
     return 0;
