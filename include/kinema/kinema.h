@@ -31,7 +31,7 @@ struct Quat {
 };
 
 // FNV-1a: stable name identity for bones and events across projects.
-constexpr u64 HashName(StringView name) {
+KINEMA_STRING_CONSTEXPR u64 HashName(StringView name) {
   u64 h = 14695981039346656037ull;
   for (char c : name) {
     h ^= static_cast<u8>(c);

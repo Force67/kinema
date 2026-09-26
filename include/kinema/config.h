@@ -28,6 +28,16 @@
 #include <vector>
 #endif
 
+// Functions that only read a StringView. std::string_view can be read in a
+// constant expression and base::StringRef cannot, so those are constexpr only
+// on the standard library (MSVC rejects a constexpr function that can never
+// be one).
+#ifdef KINEMA_USE_BASE
+#define KINEMA_STRING_CONSTEXPR inline
+#else
+#define KINEMA_STRING_CONSTEXPR constexpr
+#endif
+
 namespace kinema {
 
 #ifdef KINEMA_USE_BASE
