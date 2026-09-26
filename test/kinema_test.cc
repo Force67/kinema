@@ -1,15 +1,8 @@
 // kinema unit tests: synthetic data only, no game assets. Exits non-zero on
 // the first failure so it slots into ctest.
 
-#include <algorithm>
-#include <cmath>
-#include <cstdint>
-#include <cstdio>
-#include <cstdlib>
-#include <string>
-#include <string_view>
-#include <tuple>
-#include <vector>
+#include <math.h>
+#include <stdio.h>
 
 #include "kinema/kinema.h"
 
@@ -22,22 +15,22 @@ int failures = 0;
 #define CHECK(cond)                                                    \
   do {                                                                 \
     if (!(cond)) {                                                     \
-      std::printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond);      \
+      printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond);           \
       ++failures;                                                      \
     }                                                                  \
   } while (0)
 
-#define CHECK_NEAR(a, b, eps) CHECK(std::abs((a) - (b)) <= (eps))
+#define CHECK_NEAR(a, b, eps) CHECK(fabsf((a) - (b)) <= (eps))
 
 Quat AxisAngle(f32 x, f32 y, f32 z, f32 angle) {
-  f32 len = std::sqrt(x * x + y * y + z * z);
-  f32 s = std::sin(angle * 0.5f) / (len > 0 ? len : 1.0f);
-  return Quat{x * s, y * s, z * s, std::cos(angle * 0.5f)};
+  f32 len = sqrtf(x * x + y * y + z * z);
+  f32 s = sinf(angle * 0.5f) / (len > 0 ? len : 1.0f);
+  return Quat{x * s, y * s, z * s, cosf(angle * 0.5f)};
 }
 
 f32 QuatError(const Quat& a, const Quat& b) {
-  f32 dot = std::abs(a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w);
-  return 1.0f - std::min(dot, 1.0f);  // 0 = identical orientation
+  f32 dot = fabsf(a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w);
+  return 1.0f - Min(dot, 1.0f);  // 0 = identical orientation
 }
 
 // Round-trip: analytic tracks through the builder and sampler.
@@ -53,10 +46,10 @@ void TestClipRoundTrip() {
       return;
     }
     f32 phase = time * (1.0f + 0.3f * static_cast<f32>(track));
-    *t = Vec3{50.0f * std::sin(phase), 10.0f * static_cast<f32>(track),
-              25.0f * std::cos(phase * 0.7f)};
-    *r = AxisAngle(0.2f, 1, 0.1f * static_cast<f32>(track), 2.0f * std::sin(phase * 0.5f));
-    *s = 1.0f + 0.25f * std::sin(phase);
+    *t = Vec3{50.0f * sinf(phase), 10.0f * static_cast<f32>(track),
+              25.0f * cosf(phase * 0.7f)};
+    *r = AxisAngle(0.2f, 1, 0.1f * static_cast<f32>(track), 2.0f * sinf(phase * 0.5f));
+    *s = 1.0f + 0.25f * sinf(phase);
   };
   for (u32 f = 0; f < kFrames; ++f) {
     for (u32 track = 0; track < kTracks; ++track) {
@@ -85,7 +78,7 @@ void TestClipRoundTrip() {
     // samples - exactly what the codec stores - so the deltas below measure
     // pure quantization error, not source-curve linearization.
     f32 x = time * kRate;
-    u32 k = std::min(static_cast<u32>(x), kFrames - 2);
+    u32 k = Min(static_cast<u32>(x), kFrames - 2);
     f32 a = x - static_cast<f32>(k);
     for (u32 track = 0; track < kTracks; ++track) {
       Vec3 t0, t1;
@@ -95,13 +88,13 @@ void TestClipRoundTrip() {
       truth(track, static_cast<f32>(k + 1) / kRate, &t1, &r1, &s1);
       Vec3 t{t0.x + (t1.x - t0.x) * a, t0.y + (t1.y - t0.y) * a, t0.z + (t1.z - t0.z) * a};
       f32 s = s0 + (s1 - s0) * a;
-      worst_t = std::max({worst_t, std::abs(pose.translation[track].x - t.x),
-                          std::abs(pose.translation[track].y - t.y),
-                          std::abs(pose.translation[track].z - t.z)});
+      worst_t = Max(Max(Max(worst_t, fabsf(pose.translation[track].x - t.x)),
+                        fabsf(pose.translation[track].y - t.y)),
+                    fabsf(pose.translation[track].z - t.z));
       // Quat ground truth at key times only (nlerp between differs from the
       // codec's component lerp by < quantization for adjacent frames).
-      if (a < 1e-4f) worst_q = std::max(worst_q, QuatError(pose.rotation[track], r0));
-      worst_s = std::max(worst_s, std::abs(pose.scale[track] - s));
+      if (a < 1e-4f) worst_q = Max(worst_q, QuatError(pose.rotation[track], r0));
+      worst_s = Max(worst_s, fabsf(pose.scale[track] - s));
     }
   }
   CHECK(worst_t < 0.005f);  // 16-bit over a 100-unit range
@@ -130,7 +123,7 @@ void TestClipRoundTrip() {
   CHECK_NEAR(wrap.y, 50.0f, 1.0f);  // 25 to end + 25 past start (duration 2s)
 
   // Blob survives a copy (relocatable).
-  std::vector<u8> copy(clip.bytes());
+  Vector<u8> copy(clip.bytes());
   auto view = Clip::FromBlob(copy.data(), copy.size());
   CHECK(view.has_value());
   view->Sample(0.5f, pose);
@@ -322,9 +315,9 @@ void TestAdditiveRoundTrip() {
   ClipBuilder sb(kTracks, kFrames, kRate);
   auto truth = [](u32 track, f32 t, Vec3* tr, Quat* r, f32* s) {
     f32 p = t * (0.5f + 0.4f * static_cast<f32>(track));
-    *tr = Vec3{3.0f * std::sin(p), 2.0f * static_cast<f32>(track), std::cos(p)};
-    *r = AxisAngle(0.3f, 1.0f, 0.2f, 0.8f * std::sin(p));
-    *s = 1.0f + 0.1f * std::sin(p);
+    *tr = Vec3{3.0f * sinf(p), 2.0f * static_cast<f32>(track), cosf(p)};
+    *r = AxisAngle(0.3f, 1.0f, 0.2f, 0.8f * sinf(p));
+    *s = 1.0f + 0.1f * sinf(p);
   };
   for (u32 f = 0; f < kFrames; ++f)
     for (u32 t = 0; t < kTracks; ++t) {
@@ -351,10 +344,10 @@ void TestAdditiveRoundTrip() {
     // base + (clip - ref) at weight 1 must reproduce the source pose.
     ApplyAdditive(ref, add, 1.0f, recon);
     for (u32 t = 0; t < kTracks; ++t) {
-      worst_t = std::max({worst_t, std::abs(recon.translation[t].x - truthp.translation[t].x),
-                          std::abs(recon.translation[t].y - truthp.translation[t].y),
-                          std::abs(recon.translation[t].z - truthp.translation[t].z)});
-      worst_q = std::max(worst_q, QuatError(recon.rotation[t], truthp.rotation[t]));
+      worst_t = Max(Max(Max(worst_t, fabsf(recon.translation[t].x - truthp.translation[t].x)),
+                        fabsf(recon.translation[t].y - truthp.translation[t].y)),
+                    fabsf(recon.translation[t].z - truthp.translation[t].z));
+      worst_q = Max(worst_q, QuatError(recon.rotation[t], truthp.rotation[t]));
     }
   }
   CHECK(worst_t < 0.01f);
@@ -473,7 +466,7 @@ void TestProgramParams() {
 // A longer constant clip with a chosen duration (frames at 30 fps), used to
 // drive state clocks and exit-time windows deterministically.
 OwnedClip MakeClipDur(f32 val, f32 dur, u32 tracks = 1) {
-  u32 frames = static_cast<u32>(std::round(dur * 30.0f)) + 1;
+  u32 frames = static_cast<u32>(roundf(dur * 30.0f)) + 1;
   ClipBuilder b(tracks, frames, 30.0f);
   for (u32 f = 0; f < frames; ++f)
     for (u32 t = 0; t < tracks; ++t) b.SetSample(f, t, Vec3{val, 0, 0}, Quat{}, 1);
@@ -482,7 +475,7 @@ OwnedClip MakeClipDur(f32 val, f32 dur, u32 tracks = 1) {
 
 // Constant-pose clip with a linear +x root ramp (speed vx over duration dur).
 OwnedClip MakeMoverClip(f32 vx, f32 dur) {
-  u32 frames = static_cast<u32>(std::round(dur * 30.0f)) + 1;
+  u32 frames = static_cast<u32>(roundf(dur * 30.0f)) + 1;
   ClipBuilder b(1, frames, 30.0f);
   for (u32 f = 0; f < frames; ++f) b.SetSample(f, 0, Vec3{0, 0, 0}, Quat{}, 1);
   b.AddRootKey(dur * 0.5f, Vec3{vx * dur * 0.5f, 0, 0});
@@ -520,7 +513,7 @@ void TestRangedEvents() {
   CHECK(clip->num_ranged_events() == 3);
 
   // Blob relocatability with the v2 ranged block.
-  std::vector<u8> copy(clip.bytes());
+  Vector<u8> copy(clip.bytes());
   auto view = Clip::FromBlob(copy.data(), copy.size());
   CHECK(view.has_value());
   CHECK(view->num_ranged_events() == 3);
@@ -533,7 +526,10 @@ void TestRangedEvents() {
       if (p == RangePhase::kActive) active = true;
       if (p == RangePhase::kExit) exit = true;
     });
-    return std::make_tuple(enter, active, exit);
+    struct Phases {
+      bool enter, active, exit;
+    };
+    return Phases{enter, active, exit};
   };
   const u64 kAttack = HashName("Attack");
   // Enter step: begin crossed, sample inside -> enter + active, no exit.
@@ -582,9 +578,9 @@ void TestStateMachine() {
     inst.Init(def, A);
     PoseArena arena(1, def.max_registers());
     PoseView out = PoseView{};
-    std::vector<Vec3> ot(1);
-    std::vector<Quat> orr(1);
-    std::vector<f32> os(1);
+    Vector<Vec3> ot(1);
+    Vector<Quat> orr(1);
+    Vector<f32> os(1);
     out = PoseView{ot.data(), orr.data(), os.data(), 1};
 
     f32 p = 0.0f;
@@ -614,9 +610,9 @@ void TestStateMachine() {
     StateMachineInstance inst;
     inst.Init(def, A);
     PoseArena arena(1, def.max_registers());
-    std::vector<Vec3> ot(1);
-    std::vector<Quat> orr(1);
-    std::vector<f32> os(1);
+    Vector<Vec3> ot(1);
+    Vector<Quat> orr(1);
+    Vector<f32> os(1);
     PoseView out{ot.data(), orr.data(), os.data(), 1};
     f32 p = 1.0f;  // condition always satisfied; only the exit window gates
     PoseParams params{&p, 1};
@@ -644,9 +640,9 @@ void TestStateMachine() {
     StateMachineInstance inst;
     inst.Init(def, A);
     PoseArena arena(1, def.max_registers());
-    std::vector<Vec3> ot(1);
-    std::vector<Quat> orr(1);
-    std::vector<f32> os(1);
+    Vector<Vec3> ot(1);
+    Vector<Quat> orr(1);
+    Vector<f32> os(1);
     PoseView out{ot.data(), orr.data(), os.data(), 1};
     f32 p = 1.0f;
     PoseParams params{&p, 1};
@@ -671,9 +667,9 @@ void TestStateMachine() {
     StateMachineInstance inst;
     inst.Init(def, A);
     PoseArena arena(1, def.max_registers());
-    std::vector<Vec3> ot(1);
-    std::vector<Quat> orr(1);
-    std::vector<f32> os(1);
+    Vector<Vec3> ot(1);
+    Vector<Quat> orr(1);
+    Vector<f32> os(1);
     PoseView out{ot.data(), orr.data(), os.data(), 1};
     PoseParams params{nullptr, 0};
 
@@ -705,9 +701,9 @@ void TestStateMachine() {
     StateMachineInstance inst;
     inst.Init(def, 0);
     PoseArena arena(1, def.max_registers());
-    std::vector<Vec3> ot(1);
-    std::vector<Quat> orr(1);
-    std::vector<f32> os(1);
+    Vector<Vec3> ot(1);
+    Vector<Quat> orr(1);
+    Vector<f32> os(1);
     PoseView out{ot.data(), orr.data(), os.data(), 1};
     f32 buf[2] = {1.0f, 1.0f};  // both conditions true
     PoseParams params{buf, 2};
@@ -723,9 +719,9 @@ void TestStateMachine() {
     StateMachineInstance inst;
     inst.Init(def, 0);
     PoseArena arena(1, def.max_registers());
-    std::vector<Vec3> ot(1);
-    std::vector<Quat> orr(1);
-    std::vector<f32> os(1);
+    Vector<Vec3> ot(1);
+    Vector<Quat> orr(1);
+    Vector<f32> os(1);
     PoseView out{ot.data(), orr.data(), os.data(), 1};
     f32 buf[2] = {1.0f, 1.0f};
     PoseParams params{buf, 2};
@@ -754,9 +750,9 @@ void TestStateMachine() {
     StateMachineInstance inst;
     inst.Init(def, A);
     PoseArena arena(1, def.max_registers());
-    std::vector<Vec3> ot(1);
-    std::vector<Quat> orr(1);
-    std::vector<f32> os(1);
+    Vector<Vec3> ot(1);
+    Vector<Quat> orr(1);
+    Vector<f32> os(1);
     PoseView out{ot.data(), orr.data(), os.data(), 1};
     EventLog log;
     EventCallback cb{&log, &EventLog::OnPoint, &EventLog::OnRanged};
@@ -787,9 +783,9 @@ void TestStateMachine() {
     StateMachineInstance inst;
     inst.Init(def, A);
     PoseArena arena(1, def.max_registers());
-    std::vector<Vec3> ot(1);
-    std::vector<Quat> orr(1);
-    std::vector<f32> os(1);
+    Vector<Vec3> ot(1);
+    Vector<Quat> orr(1);
+    Vector<f32> os(1);
     PoseView out{ot.data(), orr.data(), os.data(), 1};
 
     f32 p = 0.0f;
@@ -818,8 +814,8 @@ void TestStateMachine() {
 // ---------------------------------------------------------------------------
 // Wave 3: pose tooling.
 
-std::uint64_t Fnv64(const std::vector<u8>& bytes) {
-  std::uint64_t h = 14695981039346656037ull;
+u64 Fnv64(const Vector<u8>& bytes) {
+  u64 h = 14695981039346656037ull;
   for (u8 b : bytes) {
     h ^= b;
     h *= 1099511628211ull;
@@ -843,23 +839,23 @@ Skeleton MakeBranchedSkeleton() {
 void TestLocalModelRoundTrip() {
   Skeleton s = MakeBranchedSkeleton();
   const u32 n = s.count();
-  std::vector<Vec3> lt(n);
-  std::vector<Quat> lr(n);
-  std::vector<f32> ls(n);
+  Vector<Vec3> lt(n);
+  Vector<Quat> lr(n);
+  Vector<f32> ls(n);
   PoseView local{lt.data(), lr.data(), ls.data(), n};
   for (u32 i = 0; i < n; ++i) {
     local.translation[i] = Vec3{0.5f + 0.3f * i, 1.0f - 0.1f * i, 0.2f * i};
     local.rotation[i] = AxisAngle(0.2f * i + 0.1f, 1.0f, 0.3f, 0.4f + 0.2f * i);
     local.scale[i] = 1.0f + 0.05f * i;
   }
-  std::vector<Vec3> mt(n);
-  std::vector<Quat> mr(n);
-  std::vector<f32> ms(n);
+  Vector<Vec3> mt(n);
+  Vector<Quat> mr(n);
+  Vector<f32> ms(n);
   PoseView model{mt.data(), mr.data(), ms.data(), n};
   LocalToModel(s, local, model);
-  std::vector<Vec3> bt(n);
-  std::vector<Quat> br(n);
-  std::vector<f32> bs(n);
+  Vector<Vec3> bt(n);
+  Vector<Quat> br(n);
+  Vector<f32> bs(n);
   PoseView back{bt.data(), br.data(), bs.data(), n};
   ModelToLocal(s, model, back);
   for (u32 i = 0; i < n; ++i) {
@@ -870,9 +866,9 @@ void TestLocalModelRoundTrip() {
     CHECK_NEAR(back.scale[i], local.scale[i], 1e-4f);
   }
   // ComputeModelSpace (raw-array form) must agree with LocalToModel.
-  std::vector<Vec3> ct(n);
-  std::vector<Quat> cr(n);
-  std::vector<f32> cs(n);
+  Vector<Vec3> ct(n);
+  Vector<Quat> cr(n);
+  Vector<f32> cs(n);
   ComputeModelSpace(s, local, ct.data(), cr.data(), cs.data());
   for (u32 i = 0; i < n; ++i) {
     CHECK_NEAR(ct[i].x, model.translation[i].x, 1e-5f);
@@ -922,9 +918,9 @@ void TestTwoBoneIK() {
     SolveTwoBoneIK(s, model, local, ik);
     LocalToModel(s, local, out_model);
   };
-  std::vector<Vec3> mt(4);
-  std::vector<Quat> mr(4);
-  std::vector<f32> ms(4);
+  Vector<Vec3> mt(4);
+  Vector<Quat> mr(4);
+  Vector<f32> ms(4);
   PoseView out{mt.data(), mr.data(), ms.data(), 4};
 
   // Reachable target: wrist lands on it, elbow bends toward the pole (+z).
@@ -940,18 +936,18 @@ void TestTwoBoneIK() {
 
   // Out-of-reach target clamps at full extension along the target direction.
   solve_and_model(Vec3{5, 0, 0}, Vec3{0, 0, 1}, 0.0f, 1.0f, out);
-  f32 reach = std::sqrt(out.translation[3].x * out.translation[3].x +
-                        out.translation[3].y * out.translation[3].y +
-                        out.translation[3].z * out.translation[3].z);
+  f32 reach = sqrtf(out.translation[3].x * out.translation[3].x +
+                    out.translation[3].y * out.translation[3].y +
+                    out.translation[3].z * out.translation[3].z);
   CHECK_NEAR(reach, 2.0f, 5e-3f);  // both segments straight
   CHECK_NEAR(out.translation[3].x, 2.0f, 5e-3f);
 
   // weight = 0 leaves the FK pose; weight = 0.5 moves partway to the target.
   solve_and_model(Vec3{1, 1, 0}, Vec3{0, 0, 1}, 0.0f, 0.0f, out);
-  f32 err0 = std::abs(out.translation[3].x - 1.0f) + std::abs(out.translation[3].y - 1.0f);
+  f32 err0 = fabsf(out.translation[3].x - 1.0f) + fabsf(out.translation[3].y - 1.0f);
   CHECK(err0 > 0.9f);  // still near the straight FK pose (2,0,0)
   solve_and_model(Vec3{1, 1, 0}, Vec3{0, 0, 1}, 0.0f, 0.5f, out);
-  f32 err5 = std::abs(out.translation[3].x - 1.0f) + std::abs(out.translation[3].y - 1.0f);
+  f32 err5 = fabsf(out.translation[3].x - 1.0f) + fabsf(out.translation[3].y - 1.0f);
   CHECK(err5 < err0);  // moved toward the target
 }
 
@@ -976,9 +972,9 @@ void TestLookAt() {
                 1 - 2 * (q.x * q.x + q.y * q.y)};  // rotate {0,0,1}
   };
   {
-    std::vector<Vec3> lt(1), mt(1);
-    std::vector<Quat> lr(1), mr(1);
-    std::vector<f32> lsc(1), msc(1);
+    Vector<Vec3> lt(1), mt(1);
+    Vector<Quat> lr(1), mr(1);
+    Vector<f32> lsc(1), msc(1);
     PoseView local{lt.data(), lr.data(), lsc.data(), 1};
     local.translation[0] = Vec3{0, 0, 0};
     local.rotation[0] = Quat{};
@@ -997,9 +993,9 @@ void TestLookAt() {
     CHECK_NEAR(fwd.z, 0.0f, 1e-3f);
   }
   {
-    std::vector<Vec3> lt(1), mt(1);
-    std::vector<Quat> lr(1), mr(1);
-    std::vector<f32> lsc(1), msc(1);
+    Vector<Vec3> lt(1), mt(1);
+    Vector<Quat> lr(1), mr(1);
+    Vector<f32> lsc(1), msc(1);
     PoseView local{lt.data(), lr.data(), lsc.data(), 1};
     local.translation[0] = Vec3{0, 0, 0};
     local.rotation[0] = Quat{};
@@ -1015,7 +1011,7 @@ void TestLookAt() {
     SolveLookAt(s, model, local, la);
     // Angle of the applied rotation about its axis is the clamp value.
     Quat q = local.rotation[0];
-    f32 angle = 2.0f * std::acos(std::min(1.0f, std::abs(q.w)));
+    f32 angle = 2.0f * acosf(Min(1.0f, fabsf(q.w)));
     CHECK_NEAR(angle, 0.2f, 1e-3f);
   }
 
@@ -1023,9 +1019,9 @@ void TestLookAt() {
   // land the tip on the full aim.
   Skeleton sp = MakeSpine();
   const u32 n = 4;
-  std::vector<Vec3> lt(n), mt(n);
-  std::vector<Quat> lr(n), mr(n);
-  std::vector<f32> lsc(n), msc(n);
+  Vector<Vec3> lt(n), mt(n);
+  Vector<Quat> lr(n), mr(n);
+  Vector<f32> lsc(n), msc(n);
   PoseView local{lt.data(), lr.data(), lsc.data(), n};
   local.translation[0] = Vec3{0, 0, 0};
   local.translation[1] = Vec3{0, 0, 0};
@@ -1039,7 +1035,7 @@ void TestLookAt() {
   LocalToModel(sp, local, model);
   Vec3 tip_pos = model.translation[3];
   Vec3 dir{10.0f - tip_pos.x, 2.0f - tip_pos.y, 0.0f - tip_pos.z};
-  f32 dl = std::sqrt(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z);
+  f32 dl = sqrtf(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z);
   dir = Vec3{dir.x / dl, dir.y / dl, dir.z / dl};
 
   u32 joints[3] = {1, 2, 3};
@@ -1056,7 +1052,7 @@ void TestLookAt() {
   f32 total = 1.57079633f;  // +z to +x
   for (u32 i = 0; i < 3; ++i) {
     Quat q = local.rotation[joints[i]];
-    f32 angle = 2.0f * std::acos(std::min(1.0f, std::abs(q.w)));
+    f32 angle = 2.0f * acosf(Min(1.0f, fabsf(q.w)));
     CHECK_NEAR(angle, fracs[i] * total, 5e-3f);
   }
   // Tip forward now points along the original aim direction.
@@ -1080,10 +1076,10 @@ void TestFootPlacement() {
   s.bind_rotation.assign(7, Quat{});
   s.bind_scale.assign(7, 1.0f);
   const u32 n = 7;
-  std::vector<Vec3> lt(n), mt(n);
-  std::vector<Quat> lr(n);
-  std::vector<f32> ls(n), ms(n);
-  std::vector<Quat> mr(n);
+  Vector<Vec3> lt(n), mt(n);
+  Vector<Quat> lr(n);
+  Vector<f32> ls(n), ms(n);
+  Vector<Quat> mr(n);
   PoseView local{lt.data(), lr.data(), ls.data(), n};
   // Pelvis at height 2; legs hang straight down (-y), each segment length 1.
   local.translation[0] = Vec3{0, 2, 0};       // pelvis
@@ -1136,7 +1132,7 @@ void TestFootPlacement() {
 struct NameList {
   const char** names;
 };
-std::string_view NameOf(void* user, u32 bone) {
+StringView NameOf(void* user, u32 bone) {
   return static_cast<NameList*>(user)->names[bone];
 }
 
@@ -1147,9 +1143,9 @@ void TestMirror() {
   table.Pair(1, 2, MirrorTable::Axis::kX);
   // 0 and 3 stay self-paired (centerline).
 
-  std::vector<Vec3> st(4), dt(4), d2t(4);
-  std::vector<Quat> sr(4), dr(4), d2r(4);
-  std::vector<f32> ss(4), ds(4), d2s(4);
+  Vector<Vec3> st(4), dt(4), d2t(4);
+  Vector<Quat> sr(4), dr(4), d2r(4);
+  Vector<f32> ss(4), ds(4), d2s(4);
   PoseView src{st.data(), sr.data(), ss.data(), 4};
   for (u32 i = 0; i < 4; ++i) {
     src.translation[i] = Vec3{1.0f + i, 2.0f - i, 0.5f * i};
@@ -1201,9 +1197,9 @@ void TestRetarget() {
   {
     RetargetTable rt;
     rt.Build(src, src, map_s, map_t, 3);
-    std::vector<Vec3> st(3), tt(3);
-    std::vector<Quat> sr(3), tr(3);
-    std::vector<f32> ssc(3), tsc(3);
+    Vector<Vec3> st(3), tt(3);
+    Vector<Quat> sr(3), tr(3);
+    Vector<f32> ssc(3), tsc(3);
     PoseView sp{st.data(), sr.data(), ssc.data(), 3};
     for (u32 i = 0; i < 3; ++i) {
       sp.translation[i] = Vec3{static_cast<f32>(i), 0.5f, -0.3f};
@@ -1227,9 +1223,9 @@ void TestRetarget() {
                                                                src.bind_translation[i].z * 2.0f};
     RetargetTable rt;
     rt.Build(src, tgt, map_s, map_t, 3);
-    std::vector<Vec3> st(3), tt(3);
-    std::vector<Quat> sr(3), tr(3);
-    std::vector<f32> ssc(3), tsc(3);
+    Vector<Vec3> st(3), tt(3);
+    Vector<Quat> sr(3), tr(3);
+    Vector<f32> ssc(3), tsc(3);
     PoseView sp{st.data(), sr.data(), ssc.data(), 3};
     for (u32 i = 0; i < 3; ++i) {
       sp.translation[i] = src.bind_translation[i];  // at bind
@@ -1247,7 +1243,7 @@ void TestRetarget() {
 void TestCurves() {
   constexpr u32 kFrames = 31;
   constexpr f32 kRate = 30.0f;
-  auto jaw = [](f32 t) { return 0.5f + 0.4f * std::sin(t * 3.0f); };
+  auto jaw = [](f32 t) { return 0.5f + 0.4f * sinf(t * 3.0f); };
   auto blink = [](f32 t) { return 0.2f * t; };
   ClipBuilder b(2, kFrames, kRate);
   u16 c_jaw = b.AddCurve("Jaw");
@@ -1270,16 +1266,16 @@ void TestCurves() {
   for (int i = 0; i <= 60; ++i) {
     f32 time = clip->duration() * static_cast<f32>(i) / 60.0f;
     f32 x = time * kRate;
-    u32 k = std::min(static_cast<u32>(x), kFrames - 2);
+    u32 k = Min(static_cast<u32>(x), kFrames - 2);
     f32 a = x - static_cast<f32>(k);
     f32 truth = jaw(static_cast<f32>(k) / kRate) * (1 - a) + jaw(static_cast<f32>(k + 1) / kRate) * a;
-    worst = std::max(worst, std::abs(clip->SampleCurve(HashName("Jaw"), time) - truth));
+    worst = Max(worst, fabsf(clip->SampleCurve(HashName("Jaw"), time) - truth));
   }
   CHECK(worst < 2e-4f);  // 16-bit over the curve's range
   CHECK_NEAR(clip->SampleCurve(HashName("Missing"), 0.5f, -1.0f), -1.0f, 0.0f);  // fallback
 
   // Blob relocatability with the v3 curve block.
-  std::vector<u8> copy(clip.bytes());
+  Vector<u8> copy(clip.bytes());
   auto view = Clip::FromBlob(copy.data(), copy.size());
   CHECK(view.has_value());
   CHECK(view->num_curves() == 2);
@@ -1310,10 +1306,10 @@ void TestCurves() {
 
 // Curve-free golden blobs: their byte layout must never change when the format
 // grows. Regenerate with tools/golden.cc if the layout intentionally changes.
-constexpr std::uint64_t kGoldenV1 = 0x3fdff5e4d9fd7f10ull;
-constexpr std::uint64_t kGoldenV2 = 0x180ba2330006ffc4ull;
+constexpr u64 kGoldenV1 = 0x3fdff5e4d9fd7f10ull;
+constexpr u64 kGoldenV2 = 0x180ba2330006ffc4ull;
 
-std::vector<u8> BuildGolden(bool with_ranged) {
+Vector<u8> BuildGolden(bool with_ranged) {
   ClipBuilder b(6, 41, 30.0f);
   for (u32 f = 0; f < 41; ++f) {
     f32 t = static_cast<f32>(f) / 30.0f;
@@ -1343,8 +1339,8 @@ std::vector<u8> BuildGolden(bool with_ranged) {
 }
 
 void TestGoldenByteCompat() {
-  std::vector<u8> v1 = BuildGolden(false);
-  std::vector<u8> v2 = BuildGolden(true);
+  Vector<u8> v1 = BuildGolden(false);
+  Vector<u8> v2 = BuildGolden(true);
   CHECK(Fnv64(v1) == kGoldenV1);  // curve-free v1 layout unchanged
   CHECK(Fnv64(v2) == kGoldenV2);  // curve-free v2 layout unchanged
 }
@@ -1375,9 +1371,9 @@ int main() {
   TestCurves();
   TestGoldenByteCompat();
   if (failures == 0) {
-    std::printf("kinematest: all passed\n");
+    printf("kinematest: all passed\n");
     return 0;
   }
-  std::printf("kinematest: %d failures\n", failures);
+  printf("kinematest: %d failures\n", failures);
   return 1;
 }

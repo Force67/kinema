@@ -1,6 +1,6 @@
-#include <cassert>
-#include <cmath>
-#include <cstring>
+#include <assert.h>
+#include <math.h>
+#include <string.h>
 
 #include "kinema/kinema.h"
 
@@ -9,7 +9,7 @@ namespace {
 
 inline Quat Normalize(f32 x, f32 y, f32 z, f32 w) {
   f32 len2 = x * x + y * y + z * z + w * w;
-  f32 inv = len2 > 1e-12f ? 1.0f / std::sqrt(len2) : 0.0f;
+  f32 inv = len2 > 1e-12f ? 1.0f / sqrtf(len2) : 0.0f;
   return Quat{x * inv, y * inv, z * inv, w * inv};
 }
 
@@ -30,19 +30,19 @@ inline Quat Nlerp(const Quat& a, const Quat& b, f32 t) {
 
 // log/exp of unit quaternions as axis*angle vectors (for offsets).
 inline Vec3 Log(const Quat& q) {
-  f32 len = std::sqrt(q.x * q.x + q.y * q.y + q.z * q.z);
+  f32 len = sqrtf(q.x * q.x + q.y * q.y + q.z * q.z);
   if (len < 1e-8f) return Vec3{};
-  f32 angle = 2.0f * std::atan2(len, q.w);
+  f32 angle = 2.0f * atan2f(len, q.w);
   f32 s = angle / len;
   return Vec3{q.x * s, q.y * s, q.z * s};
 }
 
 inline Quat Exp(const Vec3& v) {
-  f32 angle = std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+  f32 angle = sqrtf(v.x * v.x + v.y * v.y + v.z * v.z);
   if (angle < 1e-8f) return Quat{};
   f32 half = angle * 0.5f;
-  f32 s = std::sin(half) / angle;
-  return Quat{v.x * s, v.y * s, v.z * s, std::cos(half)};
+  f32 s = sinf(half) / angle;
+  return Quat{v.x * s, v.y * s, v.z * s, cosf(half)};
 }
 
 inline Quat Conjugate(const Quat& q) { return Quat{-q.x, -q.y, -q.z, q.w}; }
@@ -91,9 +91,9 @@ void ComputeModelSpace(const Skeleton& skeleton, ConstPoseView local, Vec3* out_
 
 void CopyPose(ConstPoseView src, PoseView dst) {
   assert(src.count == dst.count);
-  std::memcpy(dst.translation, src.translation, src.count * sizeof(Vec3));
-  std::memcpy(dst.rotation, src.rotation, src.count * sizeof(Quat));
-  std::memcpy(dst.scale, src.scale, src.count * sizeof(f32));
+  memcpy(dst.translation, src.translation, src.count * sizeof(Vec3));
+  memcpy(dst.rotation, src.rotation, src.count * sizeof(Quat));
+  memcpy(dst.scale, src.scale, src.count * sizeof(f32));
 }
 
 void BlendPoses(ConstPoseView a, ConstPoseView b, f32 alpha, PoseView dst) {
@@ -196,12 +196,12 @@ void Inertializer::Begin(ConstPoseView from, ConstPoseView to, f32 duration) {
     dr_[i] = Log(rel);
     ds_[i] = from.scale[i] - to.scale[i];
   }
-  duration_ = remaining_ = std::max(duration, 1e-4f);
+  duration_ = remaining_ = Max(duration, 1e-4f);
 }
 
 bool Inertializer::Apply(PoseView pose, f32 dt) {
   if (remaining_ <= 0) return false;
-  remaining_ = std::max(remaining_ - dt, 0.0f);
+  remaining_ = Max(remaining_ - dt, 0.0f);
   // Smootherstep complement: C2 at both ends, so the offset fades without a
   // velocity pop at the switch or at the finish.
   f32 x = 1.0f - remaining_ / duration_;

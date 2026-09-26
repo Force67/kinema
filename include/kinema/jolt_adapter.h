@@ -12,6 +12,8 @@
 // Model-space arrays come from kinema::ComputeModelSpace. The ragdoll's
 // skeleton must have been built with the same bone order (MakeSkeleton).
 
+#include <stdio.h>
+
 #include <Jolt/Jolt.h>
 
 #include <Jolt/Physics/Ragdoll/Ragdoll.h>
@@ -28,8 +30,8 @@ inline JPH::Ref<JPH::Skeleton> MakeSkeleton(const Skeleton& skeleton) {
   for (u32 i = 0; i < skeleton.count(); ++i) {
     // Jolt keys joints by string name; the hash keeps names stable without
     // hauling the original strings around.
-    std::snprintf(name, sizeof(name), "b%016llx",
-                  static_cast<unsigned long long>(skeleton.name_hashes[i]));
+    snprintf(name, sizeof(name), "b%016llx",
+             static_cast<unsigned long long>(skeleton.name_hashes[i]));
     out->AddJoint(name, skeleton.parents[i]);
   }
   return out;

@@ -3,11 +3,8 @@
 // solver reads a model-space pose the caller produced with LocalToModel and
 // writes the result back to local space. All are flat, allocation-free kernels.
 
-#include <algorithm>
-#include <cassert>
-#include <cmath>
-#include <cstring>
-#include <string>
+#include <assert.h>
+#include <math.h>
 
 #include "kinema/kinema.h"
 
@@ -16,7 +13,7 @@ namespace {
 
 inline Quat Normalize(const Quat& q) {
   f32 len2 = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w;
-  f32 inv = len2 > 1e-12f ? 1.0f / std::sqrt(len2) : 0.0f;
+  f32 inv = len2 > 1e-12f ? 1.0f / sqrtf(len2) : 0.0f;
   return Quat{q.x * inv, q.y * inv, q.z * inv, q.w * inv};
 }
 
@@ -48,23 +45,23 @@ inline f32 Dot(const Vec3& a, const Vec3& b) { return a.x * b.x + a.y * b.y + a.
 inline Vec3 Cross(const Vec3& a, const Vec3& b) {
   return Vec3{a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x};
 }
-inline f32 Length(const Vec3& a) { return std::sqrt(Dot(a, a)); }
+inline f32 Length(const Vec3& a) { return sqrtf(Dot(a, a)); }
 inline Vec3 Normalize3(const Vec3& a) {
   f32 l = Length(a);
   return l > 1e-8f ? Scale(a, 1.0f / l) : Vec3{};
 }
 
 inline Quat AxisAngle(const Vec3& axis_unit, f32 angle) {
-  f32 s = std::sin(angle * 0.5f);
-  return Quat{axis_unit.x * s, axis_unit.y * s, axis_unit.z * s, std::cos(angle * 0.5f)};
+  f32 s = sinf(angle * 0.5f);
+  return Quat{axis_unit.x * s, axis_unit.y * s, axis_unit.z * s, cosf(angle * 0.5f)};
 }
 
 // Axis*angle log/exp of unit quaternions (shortest arc).
 inline Vec3 Log(const Quat& q_in) {
   Quat q = q_in.w < 0 ? Quat{-q_in.x, -q_in.y, -q_in.z, -q_in.w} : q_in;
-  f32 len = std::sqrt(q.x * q.x + q.y * q.y + q.z * q.z);
+  f32 len = sqrtf(q.x * q.x + q.y * q.y + q.z * q.z);
   if (len < 1e-8f) return Vec3{};
-  f32 angle = 2.0f * std::atan2(len, q.w);
+  f32 angle = 2.0f * atan2f(len, q.w);
   f32 s = angle / len;
   return Vec3{q.x * s, q.y * s, q.z * s};
 }
@@ -72,8 +69,8 @@ inline Vec3 Log(const Quat& q_in) {
 inline Quat Exp(const Vec3& v) {
   f32 angle = Length(v);
   if (angle < 1e-8f) return Quat{};
-  f32 s = std::sin(angle * 0.5f) / angle;
-  return Quat{v.x * s, v.y * s, v.z * s, std::cos(angle * 0.5f)};
+  f32 s = sinf(angle * 0.5f) / angle;
+  return Quat{v.x * s, v.y * s, v.z * s, cosf(angle * 0.5f)};
 }
 
 // Shortest-arc rotation carrying unit vector a onto unit vector b.
@@ -149,7 +146,7 @@ void ModelToLocal(const Skeleton& skeleton, ConstPoseView model, PoseView local)
     }
     Quat prInv = Conjugate(model.rotation[p]);
     f32 ps = model.scale[p];
-    f32 invPs = std::abs(ps) > 1e-8f ? 1.0f / ps : 0.0f;
+    f32 invPs = fabsf(ps) > 1e-8f ? 1.0f / ps : 0.0f;
     Vec3 d = Sub(model.translation[i], model.translation[p]);
     local.translation[i] = Scale(Rotate(prInv, d), invPs);
     local.rotation[i] = Normalize(Mul(prInv, model.rotation[i]));
@@ -170,19 +167,19 @@ void SolveTwoBoneIK(const Skeleton& skeleton, ConstPoseView model, PoseView loca
 
   // Target reach, clamped to the limb's span. `soft` keeps a slack fraction at
   // full extension so the limb never fully locks.
-  f32 max_reach = (l1 + l2) * (s.soft > 0.0f ? (1.0f - std::clamp(s.soft, 0.0f, 0.95f)) : 1.0f);
-  f32 min_reach = std::abs(l1 - l2) + 1e-4f;
+  f32 max_reach = (l1 + l2) * (s.soft > 0.0f ? (1.0f - Clamp(s.soft, 0.0f, 0.95f)) : 1.0f);
+  f32 min_reach = fabsf(l1 - l2) + 1e-4f;
   Vec3 toT = Sub(s.target, A);
   f32 dist = Length(toT);
   Vec3 d = dist > 1e-6f ? Scale(toT, 1.0f / dist) : Normalize3(Sub(C, A));
-  f32 reach = std::clamp(dist, min_reach, max_reach - 1e-5f);
+  f32 reach = Clamp(dist, min_reach, max_reach - 1e-5f);
 
   // Hinge axis: normal of the plane spanned by the aim direction and the pole,
   // so the knee bends toward the pole. Robust when the limb is straight (unlike a
   // cross of the two colinear bones). Falls back to any axis perpendicular to d.
   Vec3 n = Cross(d, Sub(s.pole, A));
   if (Length(n) < 1e-6f) {
-    Vec3 t = std::abs(d.x) < 0.9f ? Vec3{1, 0, 0} : Vec3{0, 1, 0};
+    Vec3 t = fabsf(d.x) < 0.9f ? Vec3{1, 0, 0} : Vec3{0, 1, 0};
     n = Cross(d, t);
   }
   n = Normalize3(n);
@@ -190,8 +187,8 @@ void SolveTwoBoneIK(const Skeleton& skeleton, ConstPoseView model, PoseView loca
   // Solve the triangle (A, B, C) with sides l1, l2 and base `reach`: the upper
   // bone direction is the aim rotated by the interior angle at A about the hinge.
   f32 cos_alpha =
-      std::clamp((l1 * l1 + reach * reach - l2 * l2) / (2.0f * l1 * reach), -1.0f, 1.0f);
-  f32 alpha = std::acos(cos_alpha);
+      Clamp((l1 * l1 + reach * reach - l2 * l2) / (2.0f * l1 * reach), -1.0f, 1.0f);
+  f32 alpha = acosf(cos_alpha);
   Vec3 upper_dir = Rotate(AxisAngle(n, alpha), d);  // bends toward the pole side
   Vec3 Bnew = Add(A, Scale(upper_dir, l1));
   Vec3 Cnew = Add(A, Scale(d, reach));
@@ -208,7 +205,7 @@ void SolveTwoBoneIK(const Skeleton& skeleton, ConstPoseView model, PoseView loca
   Quat A_local_new = Normalize(Mul(Conjugate(ParentModelRot(skeleton, model, a)), A_model_new));
   Quat B_local_new = Normalize(Mul(Conjugate(A_model_new), B_model_new));
 
-  f32 w = std::clamp(s.weight, 0.0f, 1.0f);
+  f32 w = Clamp(s.weight, 0.0f, 1.0f);
   local.rotation[a] = Nlerp(local.rotation[a], A_local_new, w);
   local.rotation[b] = Nlerp(local.rotation[b], B_local_new, w);
 }
@@ -226,7 +223,7 @@ void SolveLookAt(const Skeleton& skeleton, ConstPoseView model, PoseView local,
   Quat joint_new = Mul(delta, model.rotation[s.joint]);
   Quat local_new =
       Normalize(Mul(Conjugate(ParentModelRot(skeleton, model, s.joint)), joint_new));
-  local.rotation[s.joint] = Nlerp(local.rotation[s.joint], local_new, std::clamp(s.weight, 0.0f, 1.0f));
+  local.rotation[s.joint] = Nlerp(local.rotation[s.joint], local_new, Clamp(s.weight, 0.0f, 1.0f));
 }
 
 void SolveLookAtChain(const Skeleton& skeleton, ConstPoseView model, PoseView local,
@@ -238,7 +235,7 @@ void SolveLookAtChain(const Skeleton& skeleton, ConstPoseView model, PoseView lo
   Vec3 fwd = Normalize3(Rotate(model.rotation[tip], s.forward));
   Quat delta = ClampAngle(FromTo(fwd, dir), s.max_angle);
   Vec3 v = Log(delta);  // world axis * angle; distributed across the chain
-  const f32 w = std::clamp(s.weight, 0.0f, 1.0f);
+  const f32 w = Clamp(s.weight, 0.0f, 1.0f);
   for (u32 i = 0; i < s.count; ++i) {
     const u32 j = s.joints[i];
     f32 frac = (s.fractions ? s.fractions[i] : 1.0f / static_cast<f32>(s.count)) * w;
@@ -269,9 +266,9 @@ f32 SolveFootPlacement(const Skeleton& skeleton, PoseView local, PoseView model_
     Vec3 ankle = model.translation[s.feet[i].ankle];
     Vec3 desired = Add(s.hits[i].point, Scale(up, s.ankle_height));
     f32 drop = Dot(Sub(desired, ankle), up);
-    pelvis_offset = std::min(pelvis_offset, drop);
+    pelvis_offset = Min(pelvis_offset, drop);
   }
-  pelvis_offset = std::max(pelvis_offset, -std::abs(s.max_drop));
+  pelvis_offset = Max(pelvis_offset, -fabsf(s.max_drop));
 
   // Sink the pelvis (and thus the whole model) along up. Applied to the pelvis's
   // local translation in its parent frame; the model scratch is shifted to match
@@ -280,7 +277,7 @@ f32 SolveFootPlacement(const Skeleton& skeleton, PoseView local, PoseView model_
   int pp = skeleton.parents[s.pelvis];
   Quat pInv = Conjugate(pp < 0 ? Quat{} : model.rotation[pp]);
   f32 pscale = pp < 0 ? 1.0f : model.scale[pp];
-  f32 inv_pscale = std::abs(pscale) > 1e-8f ? 1.0f / pscale : 1.0f;
+  f32 inv_pscale = fabsf(pscale) > 1e-8f ? 1.0f / pscale : 1.0f;
   local.translation[s.pelvis] =
       Add(local.translation[s.pelvis], Scale(Rotate(pInv, world_shift), inv_pscale));
   for (u32 i = 0; i < model_scratch.count; ++i) {
@@ -349,6 +346,24 @@ void MirrorTransform(MirrorTable::Axis axis, const Vec3& t, const Quat& q, Vec3*
   }
 }
 
+// Whether s[at, at + token.size()) spells `token`.
+bool MatchesAt(const char* s, size_t at, StringView token) {
+  for (size_t k = 0; k < token.size(); ++k) {
+    if (s[at + k] != token[k]) return false;
+  }
+  return true;
+}
+
+// Position of the first non-empty `token` in `s`, or s.size() when there is
+// none. Local because the std and base views disagree on find and npos.
+size_t FindToken(const Vector<char>& s, StringView token) {
+  if (token.empty()) return s.size();
+  for (size_t i = 0; i + token.size() <= s.size(); ++i) {
+    if (MatchesAt(s.data(), i, token)) return i;
+  }
+  return s.size();
+}
+
 }  // namespace
 
 void MirrorPose(const MirrorTable& table, ConstPoseView src, PoseView dst) {
@@ -362,27 +377,31 @@ void MirrorPose(const MirrorTable& table, ConstPoseView src, PoseView dst) {
   }
 }
 
-void BuildMirrorTable(MirrorTable& out, u32 bones, std::string_view (*name)(void* user, u32 bone),
-                      void* user, std::string_view left_token, std::string_view right_token,
+void BuildMirrorTable(MirrorTable& out, u32 bones, StringView (*name)(void* user, u32 bone),
+                      void* user, StringView left_token, StringView right_token,
                       MirrorTable::Axis axis) {
   out.Init(bones, axis);
   for (u32 i = 0; i < bones; ++i) {
     if (out.Partner(i) != i) continue;  // already paired
-    std::string ni(name(user, i));
+    // Copied: the callback may hand out a view that the next call invalidates.
+    const StringView view = name(user, i);
+    const Vector<char> ni(view.data(), view.data() + view.size());
     // Produce the mirrored name by swapping the first left<->right token.
-    std::string mirrored;
-    auto lpos = ni.find(std::string(left_token));
-    auto rpos = ni.find(std::string(right_token));
-    if (!left_token.empty() && lpos != std::string::npos) {
-      mirrored = ni.substr(0, lpos) + std::string(right_token) + ni.substr(lpos + left_token.size());
-    } else if (!right_token.empty() && rpos != std::string::npos) {
-      mirrored = ni.substr(0, rpos) + std::string(left_token) + ni.substr(rpos + right_token.size());
-    } else {
-      continue;  // centerline bone: stays self-paired
+    size_t pos = FindToken(ni, left_token);
+    StringView from = left_token, to = right_token;
+    if (pos == ni.size()) {
+      pos = FindToken(ni, right_token);
+      from = right_token;
+      to = left_token;
+      if (pos == ni.size()) continue;  // centerline bone: stays self-paired
     }
+    Vector<char> mirrored(ni.data(), ni.data() + pos);
+    mirrored.insert(mirrored.end(), to.data(), to.data() + to.size());
+    mirrored.insert(mirrored.end(), ni.data() + pos + from.size(), ni.data() + ni.size());
     for (u32 j = 0; j < bones; ++j) {
       if (j == i || out.Partner(j) != j) continue;
-      if (std::string(name(user, j)) == mirrored) {
+      const StringView other = name(user, j);
+      if (other.size() == mirrored.size() && MatchesAt(mirrored.data(), 0, other)) {
         out.Pair(i, j, axis);
         break;
       }
