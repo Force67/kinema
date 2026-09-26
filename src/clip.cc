@@ -1,7 +1,6 @@
-#include <algorithm>
-#include <cassert>
-#include <cmath>
-#include <cstring>
+#include <assert.h>
+#include <math.h>
+#include <string.h>
 
 #include "kinema/kinema.h"
 
@@ -88,7 +87,7 @@ const T* Block(const u8* blob, u64 offset) {
 inline f32 Dequant(f32 lerped) { return lerped * (2.0f / 65535.0f) - 1.0f; }
 
 inline u16 QuantSigned(f32 v) {
-  f32 q = (std::clamp(v, -1.0f, 1.0f) + 1.0f) * (65535.0f / 2.0f);
+  f32 q = (Clamp(v, -1.0f, 1.0f) + 1.0f) * (65535.0f / 2.0f);
   return static_cast<u16>(q + 0.5f);
 }
 
@@ -97,23 +96,23 @@ inline u16 QuantSigned(f32 v) {
 // ---------------------------------------------------------------------------
 // Clip view
 
-std::optional<Clip> Clip::FromBlob(const u8* data, size_t size) {
-  if (!data || size < sizeof(Header)) return std::nullopt;
+Optional<Clip> Clip::FromBlob(const u8* data, size_t size) {
+  if (!data || size < sizeof(Header)) return {};
   const Header& h = Head(data);
-  if (h.magic != kMagic) return std::nullopt;
+  if (h.magic != kMagic) return {};
   if (h.version != kVersion1 && h.version != kVersion2 && h.version != kVersion3) {
-    return std::nullopt;
+    return {};
   }
   // v1 blobs never carry ranged events (the field was reserved padding).
-  if (h.version == kVersion1 && h.num_ranged != 0) return std::nullopt;
+  if (h.version == kVersion1 && h.num_ranged != 0) return {};
   // v3 blobs carry a CurveHeader right after Header; make sure it fits.
   if (h.version == kVersion3 && CurveHeaderOffset() + sizeof(CurveHeader) > size) {
-    return std::nullopt;
+    return {};
   }
-  if (h.total_size > size) return std::nullopt;
+  if (h.total_size > size) return {};
   if (h.num_anim_rot > h.num_tracks || h.num_anim_trans > h.num_tracks ||
       h.num_anim_scale > h.num_tracks) {
-    return std::nullopt;
+    return {};
   }
   Clip clip;
   clip.blob_ = data;
@@ -160,9 +159,9 @@ f32 Clip::SampleCurveIndex(u32 index, f32 time) const {
   const f32 mn = range[index * 2], step = range[index * 2 + 1];
   const u16* keys = Block<u16>(blob_, ch->off_keys);
   if (h.num_frames < 2) return mn + static_cast<f32>(keys[index]) * step;
-  f32 x = std::clamp(time, 0.0f, h.duration) * h.frame_rate;
-  u32 k = std::min(static_cast<u32>(x), h.num_frames - 2);
-  f32 a = std::clamp(x - static_cast<f32>(k), 0.0f, 1.0f);
+  f32 x = Clamp(time, 0.0f, h.duration) * h.frame_rate;
+  u32 k = Min(static_cast<u32>(x), h.num_frames - 2);
+  f32 a = Clamp(x - static_cast<f32>(k), 0.0f, 1.0f);
   const u32 stride = ch->num_curves;
   f32 f0 = static_cast<f32>(keys[static_cast<size_t>(k) * stride + index]);
   f32 f1 = static_cast<f32>(keys[static_cast<size_t>(k + 1) * stride + index]);
@@ -179,14 +178,14 @@ void Clip::Sample(f32 time, PoseView out) const {
   assert(out.count == h.num_tracks);
   // Constant tracks (and the constant components of everything): one memcpy
   // per channel; the animated tracks overwrite their slots below.
-  std::memcpy(out.translation, Block<Vec3>(blob_, h.off_const_t), h.num_tracks * sizeof(Vec3));
-  std::memcpy(out.rotation, Block<Quat>(blob_, h.off_const_r), h.num_tracks * sizeof(Quat));
-  std::memcpy(out.scale, Block<f32>(blob_, h.off_const_s), h.num_tracks * sizeof(f32));
+  memcpy(out.translation, Block<Vec3>(blob_, h.off_const_t), h.num_tracks * sizeof(Vec3));
+  memcpy(out.rotation, Block<Quat>(blob_, h.off_const_r), h.num_tracks * sizeof(Quat));
+  memcpy(out.scale, Block<f32>(blob_, h.off_const_s), h.num_tracks * sizeof(f32));
   if (h.num_frames < 2) return;
 
-  f32 x = std::clamp(time, 0.0f, h.duration) * h.frame_rate;
-  u32 k = std::min(static_cast<u32>(x), h.num_frames - 2);
-  f32 a = std::clamp(x - static_cast<f32>(k), 0.0f, 1.0f);
+  f32 x = Clamp(time, 0.0f, h.duration) * h.frame_rate;
+  u32 k = Min(static_cast<u32>(x), h.num_frames - 2);
+  f32 a = Clamp(x - static_cast<f32>(k), 0.0f, 1.0f);
 
   // Rotations: frame-major rows, 4 u16 per animated track.
   if (h.num_anim_rot) {
@@ -203,7 +202,7 @@ void Clip::Sample(f32 time, PoseView out) const {
         c[j] = Dequant(f0 + (f1 - f0) * a);
       }
       f32 len2 = c[0] * c[0] + c[1] * c[1] + c[2] * c[2] + c[3] * c[3];
-      f32 inv = len2 > 1e-12f ? 1.0f / std::sqrt(len2) : 0.0f;
+      f32 inv = len2 > 1e-12f ? 1.0f / sqrtf(len2) : 0.0f;
       out.rotation[idx[i]] = Quat{c[0] * inv, c[1] * inv, c[2] * inv, c[3] * inv};
     }
   }
@@ -277,7 +276,7 @@ Vec3 Clip::RootDeltaLooped(f32 t0, f32 dt) const {
   // Per-loop displacement (t=0 is the zero anchor, so this is the end value).
   const Vec3 loop = RootTranslation(dur);
   // Normalize the start into [0, dur).
-  f32 start = std::fmod(t0, dur);
+  f32 start = fmodf(t0, dur);
   if (start < 0) start += dur;
   f32 remaining = dt;
   Vec3 acc{};
@@ -313,7 +312,7 @@ ClipEvent Clip::Event(u32 index) const {
                    reinterpret_cast<const char*>(blob_ + h.off_strings + r.name_off)};
 }
 
-OwnedClip::OwnedClip(std::vector<u8> blob) : blob_(std::move(blob)) {
+OwnedClip::OwnedClip(Vector<u8> blob) : blob_(kinema::move(blob)) {
   clip_ = Clip::FromBlob(blob_.data(), blob_.size());
 }
 
@@ -321,7 +320,7 @@ OwnedClip::OwnedClip(std::vector<u8> blob) : blob_(std::move(blob)) {
 // Builder
 
 ClipBuilder::ClipBuilder(u32 num_tracks, u32 num_frames, f32 frame_rate)
-    : tracks_(num_tracks), frames_(std::max(num_frames, 1u)), rate_(frame_rate) {
+    : tracks_(num_tracks), frames_(Max(num_frames, 1u)), rate_(frame_rate) {
   t_.resize(static_cast<size_t>(tracks_) * frames_);
   r_.resize(static_cast<size_t>(tracks_) * frames_);
   s_.assign(static_cast<size_t>(tracks_) * frames_, 1.0f);
@@ -334,23 +333,23 @@ void ClipBuilder::SetSample(u32 frame, u32 track, const Vec3& t, const Quat& r, 
   s_[at] = s;
 }
 
-void ClipBuilder::AddEvent(std::string_view name, f32 time) {
-  events_.emplace_back(std::string(name), time);
+void ClipBuilder::AddEvent(StringView name, f32 time) {
+  events_.push_back({String(name.data(), name.size()), time});
 }
 
-void ClipBuilder::AddRangedEvent(std::string_view name, f32 begin, f32 end) {
-  ranged_.push_back({std::string(name), begin, end});
+void ClipBuilder::AddRangedEvent(StringView name, f32 begin, f32 end) {
+  ranged_.push_back({String(name.data(), name.size()), begin, end});
 }
 
 void ClipBuilder::AddRootKey(f32 time, const Vec3& translation) {
-  root_keys_.emplace_back(time, translation);
+  root_keys_.push_back({time, translation});
 }
 
-u16 ClipBuilder::AddCurve(std::string_view name) {
+u16 ClipBuilder::AddCurve(StringView name) {
   CurveEntry e;
-  e.name = std::string(name);
+  e.name = String(name.data(), name.size());
   e.samples.assign(frames_, 0.0f);
-  curves_.push_back(std::move(e));
+  curves_.push_back(kinema::move(e));
   return static_cast<u16>(curves_.size() - 1);
 }
 
@@ -358,10 +357,10 @@ void ClipBuilder::SetCurveSample(u32 frame, u32 curve, f32 value) {
   if (curve < curves_.size() && frame < frames_) curves_[curve].samples[frame] = value;
 }
 
-std::vector<u8> ClipBuilder::Build() const {
+Vector<u8> ClipBuilder::Build() const {
   // Hemisphere-align rotations along each track so quantized components lerp
   // through the short arc, then classify constant vs animated tracks.
-  std::vector<Quat> rots = r_;
+  Vector<Quat> rots = r_;
   for (u32 t = 0; t < tracks_; ++t) {
     for (u32 f = 1; f < frames_; ++f) {
       Quat& q = rots[static_cast<size_t>(f) * tracks_ + t];
@@ -375,9 +374,9 @@ std::vector<u8> ClipBuilder::Build() const {
   // A track is constant when quantizing it could not represent it better than
   // its first value (range below one quantization step).
   constexpr f32 kRotEps = 1.0f / 65535.0f;
-  std::vector<u16> anim_rot, anim_trans, anim_scale;
-  std::vector<f32> trans_range;  // [animated][6]
-  std::vector<f32> scale_range;  // [animated][2]
+  Vector<u16> anim_rot, anim_trans, anim_scale;
+  Vector<f32> trans_range;  // [animated][6]
+  Vector<f32> scale_range;  // [animated][2]
   for (u32 t = 0; t < tracks_; ++t) {
     f32 tmin[3] = {1e30f, 1e30f, 1e30f}, tmax[3] = {-1e30f, -1e30f, -1e30f};
     f32 smin = 1e30f, smax = -1e30f;
@@ -386,13 +385,14 @@ std::vector<u8> ClipBuilder::Build() const {
     for (u32 f = 0; f < frames_; ++f) {
       size_t at = static_cast<size_t>(f) * tracks_ + t;
       const Vec3& v = t_[at];
-      tmin[0] = std::min(tmin[0], v.x), tmax[0] = std::max(tmax[0], v.x);
-      tmin[1] = std::min(tmin[1], v.y), tmax[1] = std::max(tmax[1], v.y);
-      tmin[2] = std::min(tmin[2], v.z), tmax[2] = std::max(tmax[2], v.z);
-      smin = std::min(smin, s_[at]), smax = std::max(smax, s_[at]);
+      tmin[0] = Min(tmin[0], v.x), tmax[0] = Max(tmax[0], v.x);
+      tmin[1] = Min(tmin[1], v.y), tmax[1] = Max(tmax[1], v.y);
+      tmin[2] = Min(tmin[2], v.z), tmax[2] = Max(tmax[2], v.z);
+      smin = Min(smin, s_[at]), smax = Max(smax, s_[at]);
       const Quat& q = rots[at];
-      rdev = std::max({rdev, std::abs(q.x - q0.x), std::abs(q.y - q0.y), std::abs(q.z - q0.z),
-                       std::abs(q.w - q0.w)});
+      // The left-to-right fold std::max(initializer_list) performed.
+      rdev = Max(Max(Max(Max(rdev, fabsf(q.x - q0.x)), fabsf(q.y - q0.y)), fabsf(q.z - q0.z)),
+                 fabsf(q.w - q0.w));
     }
     if (frames_ > 1 && rdev > kRotEps) anim_rot.push_back(static_cast<u16>(t));
     bool t_anim = frames_ > 1 && (tmax[0] - tmin[0] > 1e-5f || tmax[1] - tmin[1] > 1e-5f ||
@@ -410,9 +410,9 @@ std::vector<u8> ClipBuilder::Build() const {
   }
 
   // Quantized frame-major key rows.
-  std::vector<u16> rot_keys(static_cast<size_t>(frames_) * anim_rot.size() * 4);
-  std::vector<u16> trans_keys(static_cast<size_t>(frames_) * anim_trans.size() * 3);
-  std::vector<u16> scale_keys(static_cast<size_t>(frames_) * anim_scale.size());
+  Vector<u16> rot_keys(static_cast<size_t>(frames_) * anim_rot.size() * 4);
+  Vector<u16> trans_keys(static_cast<size_t>(frames_) * anim_trans.size() * 3);
+  Vector<u16> scale_keys(static_cast<size_t>(frames_) * anim_scale.size());
   for (u32 f = 0; f < frames_; ++f) {
     for (size_t i = 0; i < anim_rot.size(); ++i) {
       const Quat& q = rots[static_cast<size_t>(f) * tracks_ + anim_rot[i]];
@@ -428,7 +428,7 @@ std::vector<u8> ClipBuilder::Build() const {
       for (int c = 0; c < 3; ++c) {
         f32 step = rg[3 + c];
         f32 q = step > 0 ? (comp[c] - rg[c]) / step : 0.0f;
-        out[c] = static_cast<u16>(std::clamp(q, 0.0f, 65535.0f) + 0.5f);
+        out[c] = static_cast<u16>(Clamp(q, 0.0f, 65535.0f) + 0.5f);
       }
     }
     for (size_t i = 0; i < anim_scale.size(); ++i) {
@@ -436,53 +436,58 @@ std::vector<u8> ClipBuilder::Build() const {
       f32 step = scale_range[i * 2 + 1];
       f32 q = step > 0 ? (v - scale_range[i * 2]) / step : 0.0f;
       scale_keys[static_cast<size_t>(f) * anim_scale.size() + i] =
-          static_cast<u16>(std::clamp(q, 0.0f, 65535.0f) + 0.5f);
+          static_cast<u16>(Clamp(q, 0.0f, 65535.0f) + 0.5f);
     }
   }
 
   // String block for event names.
-  std::vector<char> strings;
-  std::vector<EventRecord> events;
+  Vector<char> strings;
+  Vector<EventRecord> events;
   for (const auto& [name, time] : events_) {
     events.push_back({HashName(name), time, static_cast<u32>(strings.size())});
     strings.insert(strings.end(), name.begin(), name.end());
     strings.push_back('\0');
   }
-  std::sort(events.begin(), events.end(),
-            [](const EventRecord& a, const EventRecord& b) { return a.time < b.time; });
+  // Equal times are the only ties. Up to 16 records this is exactly the order
+  // libstdc++'s std::sort gave (a stable insertion sort at that size); past
+  // that std::sort left tied records in unspecified order.
+  StableSort(events.data(), events.data() + events.size(),
+             [](const EventRecord& a, const EventRecord& b) { return a.time < b.time; });
   // Ranged-event records share the string block (names appended after the point
   // events'). Empty here => the blob stays a byte-identical v1 build.
-  std::vector<RangeRecord> ranged;
+  Vector<RangeRecord> ranged;
   for (const auto& re : ranged_) {
     ranged.push_back({HashName(re.name), re.begin, re.end, static_cast<u32>(strings.size()), 0});
     strings.insert(strings.end(), re.name.begin(), re.name.end());
     strings.push_back('\0');
   }
-  std::sort(ranged.begin(), ranged.end(),
-            [](const RangeRecord& a, const RangeRecord& b) { return a.begin < b.begin; });
-  std::vector<RootKey> roots;
+  // Ties on begin: as for the point events above.
+  StableSort(ranged.data(), ranged.data() + ranged.size(),
+             [](const RangeRecord& a, const RangeRecord& b) { return a.begin < b.begin; });
+  Vector<RootKey> roots;
   for (const auto& [time, v] : root_keys_) roots.push_back({time, v.x, v.y, v.z});
-  std::sort(roots.begin(), roots.end(),
-            [](const RootKey& a, const RootKey& b) { return a.time < b.time; });
+  // Ties on time: as for the point events above.
+  StableSort(roots.data(), roots.data() + roots.size(),
+             [](const RootKey& a, const RootKey& b) { return a.time < b.time; });
 
   // Float curves: per-curve (min, step) range + frame-major 16-bit keys, exactly
   // like translations. A constant curve gets step 0 (all keys read back its min).
   const u32 num_curves = static_cast<u32>(curves_.size());
-  std::vector<u64> curve_hashes(num_curves);
-  std::vector<f32> curve_range(static_cast<size_t>(num_curves) * 2);
-  std::vector<u16> curve_keys(static_cast<size_t>(frames_) * num_curves);
+  Vector<u64> curve_hashes(num_curves);
+  Vector<f32> curve_range(static_cast<size_t>(num_curves) * 2);
+  Vector<u16> curve_keys(static_cast<size_t>(frames_) * num_curves);
   for (u32 c = 0; c < num_curves; ++c) {
     const auto& samples = curves_[c].samples;
     curve_hashes[c] = HashName(curves_[c].name);
     f32 mn = 1e30f, mx = -1e30f;
-    for (f32 v : samples) mn = std::min(mn, v), mx = std::max(mx, v);
+    for (f32 v : samples) mn = Min(mn, v), mx = Max(mx, v);
     f32 step = (mx - mn) / 65535.0f;
     curve_range[c * 2] = mn;
     curve_range[c * 2 + 1] = step;
     for (u32 f = 0; f < frames_; ++f) {
       f32 q = step > 0 ? (samples[f] - mn) / step : 0.0f;
       curve_keys[static_cast<size_t>(f) * num_curves + c] =
-          static_cast<u16>(std::clamp(q, 0.0f, 65535.0f) + 0.5f);
+          static_cast<u16>(Clamp(q, 0.0f, 65535.0f) + 0.5f);
     }
   }
   const bool has_curves = num_curves > 0;
@@ -503,7 +508,7 @@ std::vector<u8> ClipBuilder::Build() const {
   h.num_root_keys = static_cast<u32>(roots.size());
   h.num_ranged = static_cast<u32>(ranged.size());
 
-  std::vector<u8> blob(sizeof(Header));
+  Vector<u8> blob(sizeof(Header));
   auto append = [&blob](const void* data, size_t bytes) -> u64 {
     blob.resize((blob.size() + 7) & ~size_t{7});
     u64 at = blob.size();
@@ -523,9 +528,9 @@ std::vector<u8> ClipBuilder::Build() const {
   }
   // Constant pose: frame 0 of every channel (animated slots get overwritten
   // during sampling, so storing them too keeps the copy branch-free).
-  std::vector<Vec3> const_t(t_.begin(), t_.begin() + tracks_);
-  std::vector<Quat> const_r(rots.begin(), rots.begin() + tracks_);
-  std::vector<f32> const_s(s_.begin(), s_.begin() + tracks_);
+  Vector<Vec3> const_t(t_.begin(), t_.begin() + tracks_);
+  Vector<Quat> const_r(rots.begin(), rots.begin() + tracks_);
+  Vector<f32> const_s(s_.begin(), s_.begin() + tracks_);
   h.off_const_t = append(const_t.data(), const_t.size() * sizeof(Vec3));
   h.off_const_r = append(const_r.data(), const_r.size() * sizeof(Quat));
   h.off_const_s = append(const_s.data(), const_s.size() * sizeof(f32));
@@ -557,10 +562,10 @@ std::vector<u8> ClipBuilder::Build() const {
     ch.off_hashes = append(curve_hashes.data(), curve_hashes.size() * sizeof(u64));
     ch.off_range = append(curve_range.data(), curve_range.size() * sizeof(f32));
     ch.off_keys = append(curve_keys.data(), curve_keys.size() * sizeof(u16));
-    std::memcpy(blob.data() + curve_hdr_at, &ch, sizeof(CurveHeader));
+    memcpy(blob.data() + curve_hdr_at, &ch, sizeof(CurveHeader));
   }
   h.total_size = blob.size();
-  std::memcpy(blob.data(), &h, sizeof(Header));
+  memcpy(blob.data(), &h, sizeof(Header));
   return blob;
 }
 

@@ -19,22 +19,9 @@
 // The library is self-contained (no engine dependencies, no exceptions, no
 // RTTI); physics engines integrate through adapters (see jolt_adapter.h).
 
-#include <cstddef>
-#include <cstdint>
-#include <optional>
-#include <string>
-#include <string_view>
-#include <utility>
-#include <vector>
+#include "kinema/config.h"
 
 namespace kinema {
-
-using u8 = std::uint8_t;
-using u16 = std::uint16_t;
-using u32 = std::uint32_t;
-using u64 = std::uint64_t;
-using i16 = std::int16_t;
-using f32 = float;
 
 struct Vec3 {
   f32 x = 0, y = 0, z = 0;
@@ -44,7 +31,7 @@ struct Quat {
 };
 
 // FNV-1a: stable name identity for bones and events across projects.
-constexpr u64 HashName(std::string_view name) {
+constexpr u64 HashName(StringView name) {
   u64 h = 14695981039346656037ull;
   for (char c : name) {
     h ^= static_cast<u8>(c);
@@ -86,9 +73,9 @@ class PoseArena {
   u32 bones() const { return bones_; }
 
  private:
-  std::vector<Vec3> translations_;
-  std::vector<Quat> rotations_;
-  std::vector<f32> scales_;
+  Vector<Vec3> translations_;
+  Vector<Quat> rotations_;
+  Vector<f32> scales_;
   u32 bones_ = 0, capacity_ = 0, used_ = 0;
 };
 
@@ -97,11 +84,11 @@ class PoseArena {
 // matrix palettes are the host engine's business.
 
 struct Skeleton {
-  std::vector<i16> parents;  // -1 = root
-  std::vector<u64> name_hashes;
-  std::vector<Vec3> bind_translation;
-  std::vector<Quat> bind_rotation;
-  std::vector<f32> bind_scale;
+  Vector<i16> parents;  // -1 = root
+  Vector<u64> name_hashes;
+  Vector<Vec3> bind_translation;
+  Vector<Quat> bind_rotation;
+  Vector<f32> bind_scale;
 
   u32 count() const { return static_cast<u32>(parents.size()); }
   // Index of the bone with this name hash, or -1.
@@ -154,7 +141,7 @@ inline bool StepContains(f32 v, f32 t0, f32 t1) {
 // layout). Blobs are relocatable and mmap-friendly: load bytes, call FromBlob.
 class Clip {
  public:
-  static std::optional<Clip> FromBlob(const u8* data, size_t size);
+  static Optional<Clip> FromBlob(const u8* data, size_t size);
 
   u32 num_tracks() const;
   u32 num_frames() const;
@@ -235,15 +222,15 @@ class Clip {
 class OwnedClip {
  public:
   OwnedClip() = default;
-  explicit OwnedClip(std::vector<u8> blob);
+  explicit OwnedClip(Vector<u8> blob);
   const Clip* get() const { return clip_ ? &*clip_ : nullptr; }
   const Clip* operator->() const { return get(); }
   explicit operator bool() const { return clip_.has_value(); }
-  const std::vector<u8>& bytes() const { return blob_; }
+  const Vector<u8>& bytes() const { return blob_; }
 
  private:
-  std::vector<u8> blob_;
-  std::optional<Clip> clip_;
+  Vector<u8> blob_;
+  Optional<Clip> clip_;
 };
 
 // Feed uniformly sampled full poses (track-ordered), then Build() quantizes,
@@ -253,39 +240,47 @@ class ClipBuilder {
   ClipBuilder(u32 num_tracks, u32 num_frames, f32 frame_rate);
   void SetSample(u32 frame, u32 track, const Vec3& t, const Quat& r, f32 s);
   void SetAdditive(bool additive) { additive_ = additive; }
-  void AddEvent(std::string_view name, f32 time);
+  void AddEvent(StringView name, f32 time);
   // Ranged event (notify state): a named span [begin, end] in clip seconds.
   // Adding any ranged event promotes the blob to v2; a clip with none stays
   // byte-identical to a v1 build (see Build).
-  void AddRangedEvent(std::string_view name, f32 begin, f32 end);
+  void AddRangedEvent(StringView name, f32 begin, f32 end);
   // Sparse cumulative root-motion keys (time, displacement-from-start).
   void AddRootKey(f32 time, const Vec3& translation);
   // Declare a named scalar curve; returns its index. Samples default to 0 until
   // set with SetCurveSample. Authoring at least one curve promotes the blob to
   // v3 (a clip with none is byte-identical to a v1/v2 build).
-  u16 AddCurve(std::string_view name);
+  u16 AddCurve(StringView name);
   void SetCurveSample(u32 frame, u32 curve, f32 value);  // uniform, like SetSample
-  std::vector<u8> Build() const;
+  Vector<u8> Build() const;
 
  private:
+  struct EventEntry {
+    String name;
+    f32 time;
+  };
   struct RangedEntry {
-    std::string name;
+    String name;
     f32 begin, end;
   };
+  struct RootEntry {
+    f32 time;
+    Vec3 translation;
+  };
   struct CurveEntry {
-    std::string name;
-    std::vector<f32> samples;  // frames_ values
+    String name;
+    Vector<f32> samples;  // frames_ values
   };
   u32 tracks_, frames_;
   f32 rate_;
   bool additive_ = false;
-  std::vector<Vec3> t_;  // [frame * tracks + track]
-  std::vector<Quat> r_;
-  std::vector<f32> s_;
-  std::vector<std::pair<std::string, f32>> events_;
-  std::vector<RangedEntry> ranged_;
-  std::vector<std::pair<f32, Vec3>> root_keys_;
-  std::vector<CurveEntry> curves_;
+  Vector<Vec3> t_;  // [frame * tracks + track]
+  Vector<Quat> r_;
+  Vector<f32> s_;
+  Vector<EventEntry> events_;
+  Vector<RangedEntry> ranged_;
+  Vector<RootEntry> root_keys_;
+  Vector<CurveEntry> curves_;
 };
 
 // ---------------------------------------------------------------------------
@@ -334,7 +329,7 @@ class BoneMask {
   u32 size() const { return static_cast<u32>(weights_.size()); }
 
  private:
-  std::vector<f32> weights_;
+  Vector<f32> weights_;
 };
 
 // ---------------------------------------------------------------------------
@@ -362,8 +357,8 @@ class BlendSpace {
 
  private:
   Dim dim_ = Dim::k1D;
-  std::vector<const Clip*> clips_;
-  std::vector<f32> x_, y_;
+  Vector<const Clip*> clips_;
+  Vector<f32> x_, y_;
 };
 
 // Evaluate a blend space into `dst` at coordinate (x[,y]) and normalized phase,
@@ -428,9 +423,9 @@ class Inertializer {
   bool active() const { return remaining_ > 0; }
 
  private:
-  std::vector<Vec3> dt_;
-  std::vector<Vec3> dr_;  // rotation offsets, axis*angle
-  std::vector<f32> ds_;
+  Vector<Vec3> dt_;
+  Vector<Vec3> dr_;  // rotation offsets, axis*angle
+  Vector<f32> ds_;
   f32 remaining_ = 0, duration_ = 0;
 };
 
@@ -462,11 +457,11 @@ class SyncGroup {
 
  private:
   struct Track {
-    std::vector<f32> markers;
+    Vector<f32> markers;
     f32 duration = 0;
   };
   f32 MarkerTime(const Track& t, f32 g) const;
-  std::vector<Track> tracks_;
+  Vector<Track> tracks_;
   u32 markers_ = 0;
   f32 phase_ = 0;  // global marker-phase in [0, markers_)
 };
@@ -551,10 +546,10 @@ class StateMachine {
     InterruptPolicy policy = InterruptPolicy::kWaitForCompletion;
   };
   u32 bones_ = 0, max_regs_ = 1;
-  std::vector<State> states_;
-  std::vector<Transition> transitions_;
-  std::vector<ConditionAtom> conds_;
-  std::vector<PoseOp> ops_;  // template ops; states slice into this
+  Vector<State> states_;
+  Vector<Transition> transitions_;
+  Vector<ConditionAtom> conds_;
+  Vector<PoseOp> ops_;  // template ops; states slice into this
 };
 
 // Builds a StateMachine. Each Add*State returns the new state's id (its index).
@@ -641,10 +636,10 @@ class StateMachineInstance {
   u64 triggers_ = 0;
   Vec3 root_{};
   Inertializer inert_;
-  std::vector<Vec3> from_t_;
-  std::vector<Quat> from_r_;
-  std::vector<f32> from_s_;
-  std::vector<PoseOp> scratch_ops_;
+  Vector<Vec3> from_t_;
+  Vector<Quat> from_r_;
+  Vector<f32> from_s_;
+  Vector<PoseOp> scratch_ops_;
 };
 
 // ---------------------------------------------------------------------------
@@ -753,8 +748,8 @@ class MirrorTable {
   Axis axis(u32 bone) const { return axis_[bone]; }
 
  private:
-  std::vector<u32> partner_;
-  std::vector<Axis> axis_;
+  Vector<u32> partner_;
+  Vector<Axis> axis_;
 };
 
 void MirrorPose(const MirrorTable& table, ConstPoseView src, PoseView dst);
@@ -764,8 +759,8 @@ void MirrorPose(const MirrorTable& table, ConstPoseView src, PoseView dst);
 // swapping the first occurrence of left_token<->right_token (e.g. "L_"/"R_" or
 // " L "/" R "). Bones with no partner mirror onto themselves.
 void BuildMirrorTable(MirrorTable& out, u32 bones,
-                      std::string_view (*name)(void* user, u32 bone), void* user,
-                      std::string_view left_token, std::string_view right_token,
+                      StringView (*name)(void* user, u32 bone), void* user,
+                      StringView left_token, StringView right_token,
                       MirrorTable::Axis axis = MirrorTable::Axis::kX);
 
 // ---------------------------------------------------------------------------
@@ -794,7 +789,7 @@ class RetargetTable {
   const Map* maps() const { return maps_.data(); }
 
  private:
-  std::vector<Map> maps_;
+  Vector<Map> maps_;
 };
 
 void RetargetPose(const RetargetTable& table, ConstPoseView src_local, PoseView tgt_local);

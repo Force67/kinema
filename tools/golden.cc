@@ -6,9 +6,7 @@
 //
 //   cmake --build build --target kinema_golden && ./build/tools/kinema_golden
 
-#include <cstdint>
-#include <cstdio>
-#include <vector>
+#include <stdio.h>
 
 #include "kinema/kinema.h"
 
@@ -16,8 +14,8 @@ namespace {
 
 using namespace kinema;
 
-std::uint64_t Fnv64(const std::vector<u8>& bytes) {
-  std::uint64_t h = 14695981039346656037ull;
+u64 Fnv64(const Vector<u8>& bytes) {
+  u64 h = 14695981039346656037ull;
   for (u8 b : bytes) {
     h ^= b;
     h *= 1099511628211ull;
@@ -27,7 +25,7 @@ std::uint64_t Fnv64(const std::vector<u8>& bytes) {
 
 // A v1 clip: constant + animated bone tracks, point events, root keys. No
 // ranged events, no curves -> must stay byte-identical forever.
-std::vector<u8> BuildV1() {
+Vector<u8> BuildV1() {
   ClipBuilder b(6, 41, 30.0f);
   for (u32 f = 0; f < 41; ++f) {
     f32 t = static_cast<f32>(f) / 30.0f;
@@ -57,8 +55,8 @@ std::vector<u8> BuildV1() {
 
 // A v2 clip: same as v1 plus a ranged event. Curve-free -> must stay
 // byte-identical when curves are added to the format.
-std::vector<u8> BuildV2() {
-  std::vector<u8> unused = BuildV1();
+Vector<u8> BuildV2() {
+  Vector<u8> unused = BuildV1();
   (void)unused;
   ClipBuilder b(6, 41, 30.0f);
   for (u32 f = 0; f < 41; ++f) {
@@ -91,11 +89,11 @@ std::vector<u8> BuildV2() {
 }  // namespace
 
 int main() {
-  std::vector<u8> v1 = BuildV1();
-  std::vector<u8> v2 = BuildV2();
-  std::printf("kGoldenV1 = 0x%016llxull;  // %zu bytes\n",
-              static_cast<unsigned long long>(Fnv64(v1)), v1.size());
-  std::printf("kGoldenV2 = 0x%016llxull;  // %zu bytes\n",
-              static_cast<unsigned long long>(Fnv64(v2)), v2.size());
+  Vector<u8> v1 = BuildV1();
+  Vector<u8> v2 = BuildV2();
+  printf("kGoldenV1 = 0x%016llxull;  // %zu bytes\n",
+         static_cast<unsigned long long>(Fnv64(v1)), static_cast<size_t>(v1.size()));
+  printf("kGoldenV2 = 0x%016llxull;  // %zu bytes\n",
+         static_cast<unsigned long long>(Fnv64(v2)), static_cast<size_t>(v2.size()));
   return 0;
 }

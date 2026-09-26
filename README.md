@@ -110,6 +110,12 @@ add_subdirectory(libs/kinema)
 target_link_libraries(game PRIVATE kinema::kinema)
 ```
 
+`-DKINEMA_USE_BASE=ON` builds kinema on equilibrium's `base` library instead of
+the standard library, without exceptions; the API then takes and returns
+`base::Vector`, `base::String`, `base::StringRef` and `base::Optional` (see
+`include/kinema/config.h`). kinema reuses an existing `equilibrium::base`
+target, or builds one from `-DKINEMA_EQUILIBRIUM_DIR=<checkout>`.
+
 ```cpp
 #include <kinema/kinema.h>
 

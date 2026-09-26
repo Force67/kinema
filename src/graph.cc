@@ -2,10 +2,8 @@
 // extend the compiled-program model - new builder-time structures and flat
 // runtime kernels - without touching the clip blob format.
 
-#include <algorithm>
-#include <cassert>
-#include <cmath>
-#include <vector>
+#include <assert.h>
+#include <math.h>
 
 #include "kinema/kinema.h"
 
@@ -14,7 +12,7 @@ namespace {
 
 inline Quat Normalize(f32 x, f32 y, f32 z, f32 w) {
   f32 len2 = x * x + y * y + z * z + w * w;
-  f32 inv = len2 > 1e-12f ? 1.0f / std::sqrt(len2) : 0.0f;
+  f32 inv = len2 > 1e-12f ? 1.0f / sqrtf(len2) : 0.0f;
   return Quat{x * inv, y * inv, z * inv, w * inv};
 }
 
@@ -34,16 +32,16 @@ inline Quat Conjugate(const Quat& q) { return Quat{-q.x, -q.y, -q.z, q.w}; }
 
 OwnedClip MakeAdditiveClip(const Clip& source, ConstPoseView reference) {
   const u32 tracks = source.num_tracks();
-  const u32 frames = std::max(source.num_frames(), 1u);
+  const u32 frames = Max(source.num_frames(), 1u);
   const f32 rate = source.frame_rate();
   assert(reference.count == tracks);
 
   ClipBuilder builder(tracks, frames, rate);
   builder.SetAdditive(true);
 
-  std::vector<Vec3> st(tracks);
-  std::vector<Quat> sr(tracks);
-  std::vector<f32> ss(tracks);
+  Vector<Vec3> st(tracks);
+  Vector<Quat> sr(tracks);
+  Vector<f32> ss(tracks);
   PoseView sp{st.data(), sr.data(), ss.data(), tracks};
   for (u32 f = 0; f < frames; ++f) {
     f32 time = rate > 0 ? static_cast<f32>(f) / rate : 0.0f;
@@ -55,7 +53,7 @@ OwnedClip MakeAdditiveClip(const Clip& source, ConstPoseView reference) {
       Quat dr = Mul(Conjugate(reference.rotation[t]), sr[t]);
       dr = Normalize(dr.x, dr.y, dr.z, dr.w);
       f32 rs = reference.scale[t];
-      f32 ds = std::abs(rs) > 1e-8f ? ss[t] / rs : ss[t];
+      f32 ds = fabsf(rs) > 1e-8f ? ss[t] / rs : ss[t];
       builder.SetSample(f, t, dt, dr, ds);
     }
   }
@@ -64,9 +62,9 @@ OwnedClip MakeAdditiveClip(const Clip& source, ConstPoseView reference) {
 
 OwnedClip MakeAdditiveClipFromFirstFrame(const Clip& source) {
   const u32 tracks = source.num_tracks();
-  std::vector<Vec3> rt(tracks);
-  std::vector<Quat> rr(tracks);
-  std::vector<f32> rs(tracks);
+  Vector<Vec3> rt(tracks);
+  Vector<Quat> rr(tracks);
+  Vector<f32> rs(tracks);
   PoseView ref{rt.data(), rr.data(), rs.data(), tracks};
   source.Sample(0.0f, ref);
   return MakeAdditiveClip(source, ref);
@@ -76,7 +74,9 @@ OwnedClip MakeAdditiveClipFromFirstFrame(const Clip& source) {
 // Bone mask
 
 void BoneMask::Init(u32 bones, f32 fill) { weights_.assign(bones, fill); }
-void BoneMask::Fill(f32 weight) { std::fill(weights_.begin(), weights_.end(), weight); }
+void BoneMask::Fill(f32 weight) {
+  for (f32& w : weights_) w = weight;
+}
 void BoneMask::Set(u32 bone, f32 weight) {
   if (bone < weights_.size()) weights_[bone] = weight;
 }
@@ -88,7 +88,7 @@ void BoneMask::SetChain(const Skeleton& skeleton, u32 bone, f32 weight, bool des
   // Parents precede children, so a single forward sweep marks the whole subtree:
   // any joint whose parent is already in the set joins it.
   const u32 n = skeleton.count();
-  std::vector<u8> in(n, 0);
+  Vector<u8> in(n, 0);
   in[bone] = 1;
   for (u32 i = 0; i < n && i < weights_.size(); ++i) {
     int p = skeleton.parents[i];
@@ -111,12 +111,16 @@ BlendSpace& BlendSpace::Add(const Clip* clip, f32 x, f32 y) {
 
 void BlendSpace::Finalize() {
   if (dim_ != Dim::k1D || clips_.size() < 2) return;
-  // Sort samples ascending by x so bracketing is a linear scan.
-  std::vector<u32> order(clips_.size());
+  // Sort samples ascending by x so bracketing is a linear scan. Samples sharing
+  // an x keep their Add order: up to 16 samples that is exactly libstdc++'s
+  // std::sort order (a stable insertion sort at that size); past that
+  // std::sort left them in unspecified order.
+  Vector<u32> order(clips_.size());
   for (u32 i = 0; i < order.size(); ++i) order[i] = i;
-  std::sort(order.begin(), order.end(), [this](u32 a, u32 b) { return x_[a] < x_[b]; });
-  std::vector<const Clip*> c(clips_.size());
-  std::vector<f32> nx(x_.size()), ny(y_.size());
+  StableSort(order.data(), order.data() + order.size(),
+             [this](u32 a, u32 b) { return x_[a] < x_[b]; });
+  Vector<const Clip*> c(clips_.size());
+  Vector<f32> nx(x_.size()), ny(y_.size());
   for (u32 i = 0; i < order.size(); ++i) {
     c[i] = clips_[order[i]];
     nx[i] = x_[order[i]];
@@ -130,7 +134,7 @@ void BlendSpace::Finalize() {
 namespace {
 
 void SampleAtPhase(const Clip* clip, f32 phase, PoseView dst) {
-  clip->Sample(std::clamp(phase, 0.0f, 1.0f) * clip->duration(), dst);
+  clip->Sample(Clamp(phase, 0.0f, 1.0f) * clip->duration(), dst);
 }
 
 }  // namespace
@@ -184,9 +188,9 @@ void EvalBlendSpace(const BlendSpace& space, f32 x, f32 y, f32 phase, PoseView d
       f32 isy = y - space.y(i);
       f32 denom = ijx * ijx + ijy * ijy;
       f32 t = denom > 1e-12f ? (isx * ijx + isy * ijy) / denom : 0.0f;
-      wi = std::min(wi, 1.0f - t);
+      wi = Min(wi, 1.0f - t);
     }
-    wi = std::max(wi, 0.0f);
+    wi = Max(wi, 0.0f);
     if (wi <= 0.0f) continue;
     SampleAtPhase(space.clip(i), phase, scratch);
     if (total <= 0.0f) {
@@ -228,14 +232,17 @@ void SyncGroup::AddClipMarkers(const f32* marker_times, u32 marker_count, f32 du
   assert(tracks_.empty() || marker_count == markers_);
   Track tr;
   tr.markers.assign(marker_times, marker_times + marker_count);
-  std::sort(tr.markers.begin(), tr.markers.end());
+  // Markers are bare floats, so tied ones are the same time (+0 against -0 at
+  // most, equal as times): every correct sort yields the same marker track.
+  StableSort(tr.markers.data(), tr.markers.data() + tr.markers.size(),
+             [](f32 a, f32 b) { return a < b; });
   tr.duration = duration;
   markers_ = marker_count;
-  tracks_.push_back(std::move(tr));
+  tracks_.push_back(kinema::move(tr));
 }
 
 void SyncGroup::AddClip(const Clip& clip) {
-  std::vector<f32> times;
+  Vector<f32> times;
   const u32 ne = clip.num_events();
   times.reserve(ne);
   for (u32 i = 0; i < ne; ++i) times.push_back(clip.Event(i).time);
@@ -248,7 +255,7 @@ void SyncGroup::Reset(f32 phase) {
     phase_ = 0;
     return;
   }
-  phase_ = std::fmod(phase, static_cast<f32>(markers_));
+  phase_ = fmodf(phase, static_cast<f32>(markers_));
   if (phase_ < 0) phase_ += static_cast<f32>(markers_);
 }
 
@@ -256,13 +263,13 @@ f32 SyncGroup::MarkerTime(const Track& t, f32 g) const {
   const u32 K = markers_;
   if (K == 0) return 0.0f;
   u32 seg = static_cast<u32>(g) % K;
-  f32 frac = g - std::floor(g);
+  f32 frac = g - floorf(g);
   f32 t0 = t.markers[seg];
   // The last segment wraps through the clip end back to the first marker.
   f32 t1 = (seg + 1 < K) ? t.markers[seg + 1] : t.duration + t.markers[0];
   f32 local = t0 + frac * (t1 - t0);
   if (t.duration > 1e-6f) {
-    local = std::fmod(local, t.duration);
+    local = fmodf(local, t.duration);
     if (local < 0) local += t.duration;
   }
   return local;
@@ -279,12 +286,12 @@ void SyncGroup::Advance(f32 dt, u32 leader, f32 play_rate) {
   int guard = 0;
   while (remaining > 1e-9f && guard++ < 4096) {
     u32 seg = static_cast<u32>(phase_) % K;
-    f32 frac = phase_ - std::floor(phase_);
+    f32 frac = phase_ - floorf(phase_);
     f32 t0 = L.markers[seg];
     f32 t1 = (seg + 1 < K) ? L.markers[seg + 1] : L.duration + L.markers[0];
     f32 seg_len = t1 - t0;
     if (seg_len <= 1e-8f) {  // degenerate segment: step over it
-      phase_ = std::floor(phase_) + 1.0f;
+      phase_ = floorf(phase_) + 1.0f;
     } else {
       f32 time_left = seg_len * (1.0f - frac);
       if (remaining < time_left) {
@@ -292,7 +299,7 @@ void SyncGroup::Advance(f32 dt, u32 leader, f32 play_rate) {
         remaining = 0.0f;
       } else {
         remaining -= time_left;
-        phase_ = std::floor(phase_) + 1.0f;
+        phase_ = floorf(phase_) + 1.0f;
       }
     }
     if (phase_ >= static_cast<f32>(K)) phase_ -= static_cast<f32>(K);

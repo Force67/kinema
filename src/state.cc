@@ -4,17 +4,16 @@
 // the pose through the existing program model. No node trees are walked at
 // runtime and nothing is allocated per frame (buffers are sized once at Init).
 
-#include <algorithm>
-#include <cassert>
-#include <cmath>
+#include <assert.h>
+#include <math.h>
 
 #include "kinema/kinema.h"
 
 namespace kinema {
 namespace {
 
-inline f32 Fract(f32 x) { return x - std::floor(x); }
-inline f32 Clamp01(f32 x) { return std::clamp(x, 0.0f, 1.0f); }
+inline f32 Fract(f32 x) { return x - floorf(x); }
+inline f32 Clamp01(f32 x) { return Clamp(x, 0.0f, 1.0f); }
 inline Vec3 Lerp(const Vec3& a, const Vec3& b, f32 w) {
   return Vec3{a.x + (b.x - a.x) * w, a.y + (b.y - a.y) * w, a.z + (b.z - a.z) * w};
 }
@@ -23,7 +22,7 @@ inline Vec3 Lerp(const Vec3& a, const Vec3& b, f32 w) {
 // states advance in [0,1) cycles; scale by the reference clip's duration.
 inline f32 ToClipTime(bool phase_clock, bool loop, f32 clock, f32 ref_dur) {
   if (phase_clock) return (loop ? Fract(clock) : Clamp01(clock)) * ref_dur;
-  return (loop && ref_dur > 1e-6f) ? std::fmod(clock, ref_dur) : clock;
+  return (loop && ref_dur > 1e-6f) ? fmodf(clock, ref_dur) : clock;
 }
 
 }  // namespace
@@ -47,7 +46,7 @@ u16 StateMachineBuilder::AddClipState(const Clip* clip, bool loop, f32 speed) {
   op.dst = 0;
   op.clip = clip;
   sm_.ops_.push_back(op);
-  sm_.max_regs_ = std::max(sm_.max_regs_, 1u);
+  sm_.max_regs_ = Max(sm_.max_regs_, 1u);
   sm_.states_.push_back(st);
   return static_cast<u16>(sm_.states_.size() - 1);
 }
@@ -71,7 +70,7 @@ u16 StateMachineBuilder::AddBlendSpaceState(const BlendSpace* space, i16 coord_p
   op.space = space;
   op.coord_param = coord_param;
   sm_.ops_.push_back(op);
-  sm_.max_regs_ = std::max(sm_.max_regs_, 2u);
+  sm_.max_regs_ = Max(sm_.max_regs_, 2u);
   sm_.states_.push_back(st);
   return static_cast<u16>(sm_.states_.size() - 1);
 }
@@ -90,7 +89,7 @@ u16 StateMachineBuilder::AddProgramState(const PoseOp* ops, u32 count, u32 reg_c
   st.clip = clip;
   st.root_source = root_source;
   for (u32 i = 0; i < count; ++i) sm_.ops_.push_back(ops[i]);
-  sm_.max_regs_ = std::max(sm_.max_regs_, std::max(reg_count, 1u));
+  sm_.max_regs_ = Max(sm_.max_regs_, Max(reg_count, 1u));
   sm_.states_.push_back(st);
   return static_cast<u16>(sm_.states_.size() - 1);
 }
@@ -131,7 +130,7 @@ void StateMachineInstance::Init(const StateMachine& def, u16 start_state) {
   from_r_.assign(def.bones_, Quat{});
   from_s_.assign(def.bones_, 1.0f);
   u32 max_ops = 1;
-  for (const auto& s : def.states_) max_ops = std::max(max_ops, s.ops_count);
+  for (const auto& s : def.states_) max_ops = Max(max_ops, s.ops_count);
   scratch_ops_.assign(max_ops, PoseOp{});
 }
 
@@ -147,8 +146,8 @@ PoseView StateMachineInstance::RunState(u16 s, f32 clock, const PoseParams& para
     PoseOp& op = scratch_ops_[static_cast<u32>(st.clock_op)];
     op.time = st.phase_clock
                   ? (st.loop ? Fract(clock) : Clamp01(clock))
-                  : (st.loop && st.loop_duration > 1e-6f ? std::fmod(clock, st.loop_duration)
-                                                         : clock);
+                  : (st.loop && st.loop_duration > 1e-6f ? fmodf(clock, st.loop_duration)
+                                                      : clock);
     op.time_param = -1;  // the state clock overrides any param binding
   }
   return ExecuteProgram(scratch_ops_.data(), st.ops_count, arena, &params);
@@ -158,7 +157,7 @@ f32 StateMachineInstance::NormalizedPhase(u16 s, f32 t) const {
   const StateMachine::State& st = def_->states_[s];
   if (st.phase_clock) return st.loop ? Fract(t) : Clamp01(t);
   if (st.loop_duration <= 1e-6f) return 0.0f;
-  f32 p = std::fmod(t, st.loop_duration) / st.loop_duration;
+  f32 p = fmodf(t, st.loop_duration) / st.loop_duration;
   return p < 0 ? p + 1.0f : p;
 }
 
@@ -179,10 +178,10 @@ bool StateMachineInstance::CondsPass(const StateMachine::Transition& tr,
         if (!(v > c.value)) return false;
         break;
       case ConditionAtom::Test::kEqual:
-        if (!(std::abs(v - c.value) <= 1e-6f)) return false;
+        if (!(fabsf(v - c.value) <= 1e-6f)) return false;
         break;
       case ConditionAtom::Test::kNotEqual:
-        if (!(std::abs(v - c.value) > 1e-6f)) return false;
+        if (!(fabsf(v - c.value) > 1e-6f)) return false;
         break;
       case ConditionAtom::Test::kTrigger:
         break;  // handled above
